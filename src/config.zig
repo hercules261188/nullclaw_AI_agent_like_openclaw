@@ -190,6 +190,15 @@ pub const Config = struct {
         return true;
     }
 
+    /// Look up the optional User-Agent for a provider.
+    /// Returns null if provider is not in the list or has no user_agent set.
+    pub fn getProviderUserAgent(self: *const Config, name: []const u8) ?[]const u8 {
+        for (self.providers) |e| {
+            if (std.mem.eql(u8, e.name, name)) return e.user_agent;
+        }
+        return null;
+    }
+
     /// Sync flat convenience fields from the nested sub-configs.
     pub fn syncFlatFields(self: *Config) void {
         self.temperature = self.default_temperature;

@@ -19,13 +19,16 @@ const TokenUsage = root.TokenUsage;
 pub const OpenAiProvider = struct {
     api_key: ?[]const u8,
     allocator: std.mem.Allocator,
+    /// Optional User-Agent header for HTTP requests.
+    user_agent: ?[]const u8 = null,
 
     const BASE_URL = "https://api.openai.com/v1/chat/completions";
 
-    pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8) OpenAiProvider {
+    pub fn init(allocator: std.mem.Allocator, api_key: ?[]const u8, user_agent: ?[]const u8) OpenAiProvider {
         return .{
             .api_key = api_key,
             .allocator = allocator,
+            .user_agent = user_agent,
         };
     }
 
@@ -197,7 +200,19 @@ pub const OpenAiProvider = struct {
         var auth_hdr_buf: [512]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
 
-        return sse.curlStream(allocator, BASE_URL, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
+        // Build extra headers (User-Agent if configured)
+        var extra_headers: [1][]const u8 = undefined;
+        var extra_header_count: usize = 0;
+        var user_agent_buf: [256]u8 = undefined;
+        if (self.user_agent) |ua| {
+            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
+            if (ua_header) |h| {
+                extra_headers[extra_header_count] = h;
+                extra_header_count += 1;
+            }
+        }
+
+        return sse.curlStream(allocator, BASE_URL, body, auth_hdr, extra_headers[0..extra_header_count], request.timeout_secs, callback, callback_ctx);
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
@@ -218,10 +233,23 @@ pub const OpenAiProvider = struct {
         const body = try buildRequestBody(allocator, system_prompt, message, model, temperature);
         defer allocator.free(body);
 
+        // Build headers (auth + optional User-Agent)
+        var headers_buf: [2][]const u8 = undefined;
+        var header_count: usize = 0;
         var auth_hdr_buf: [512]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
+        headers_buf[header_count] = auth_hdr;
+        header_count += 1;
+        var user_agent_buf: [256]u8 = undefined;
+        if (self.user_agent) |ua| {
+            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
+            if (ua_header) |h| {
+                headers_buf[header_count] = h;
+                header_count += 1;
+            }
+        }
 
-        const resp_body = root.curlPost(allocator, BASE_URL, body, &.{auth_hdr}) catch return error.OpenAiApiError;
+        const resp_body = root.curlPost(allocator, BASE_URL, body, headers_buf[0..header_count]) catch return error.OpenAiApiError;
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body);
@@ -240,10 +268,23 @@ pub const OpenAiProvider = struct {
         const body = try buildChatRequestBody(allocator, request, model, temperature);
         defer allocator.free(body);
 
+        // Build headers (auth + optional User-Agent)
+        var headers_buf: [2][]const u8 = undefined;
+        var header_count: usize = 0;
         var auth_hdr_buf: [512]u8 = undefined;
         const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "Authorization: Bearer {s}", .{api_key}) catch return error.OpenAiApiError;
+        headers_buf[header_count] = auth_hdr;
+        header_count += 1;
+        var user_agent_buf: [256]u8 = undefined;
+        if (self.user_agent) |ua| {
+            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
+            if (ua_header) |h| {
+                headers_buf[header_count] = h;
+                header_count += 1;
+            }
+        }
 
-        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, &.{auth_hdr}, request.timeout_secs) catch return error.OpenAiApiError;
+        const resp_body = root.curlPostTimed(allocator, BASE_URL, body, headers_buf[0..header_count], request.timeout_secs) catch return error.OpenAiApiError;
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body);
@@ -420,7 +461,7 @@ test "parseNativeResponse with tool calls" {
 }
 
 test "supportsNativeTools returns true" {
-    var p = OpenAiProvider.init(std.testing.allocator, "key");
+    var p = OpenAiProvider.init(std.testing.allocator, "key", null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
 }
@@ -533,7 +574,7 @@ test "buildStreamingChatRequestBody reasoning model uses max_completion_tokens" 
 }
 
 test "provider getName returns OpenAI" {
-    var p = OpenAiProvider.init(std.testing.allocator, "key");
+    var p = OpenAiProvider.init(std.testing.allocator, "key", null);
     const prov = p.provider();
     try std.testing.expectEqualStrings("OpenAI", prov.getName());
 }

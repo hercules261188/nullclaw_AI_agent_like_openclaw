@@ -1590,6 +1590,9 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (val.object.get("native_tools")) |nt| {
                             if (nt == .bool) pe.native_tools = nt.bool;
                         }
+                        if (val.object.get("user_agent")) |ua| {
+                            if (ua == .string) pe.user_agent = try self.allocator.dupe(u8, ua.string);
+                        }
                         try prov_list.append(self.allocator, pe);
                     }
                     self.providers = try prov_list.toOwnedSlice(self.allocator);

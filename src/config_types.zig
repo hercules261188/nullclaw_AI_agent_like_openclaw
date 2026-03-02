@@ -41,6 +41,9 @@ pub const ProviderEntry = struct {
     /// Whether this provider supports native OpenAI-style tool_calls.
     /// Set to false to use XML tool format via system prompt instead.
     native_tools: bool = true,
+    /// Optional User-Agent header for HTTP requests to this provider.
+    /// When set, requests will include "User-Agent: {value}" header.
+    user_agent: ?[]const u8 = null,
 };
 
 // ── Audio media config (tools.media.audio) ─────────────────────

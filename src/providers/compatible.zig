@@ -67,6 +67,9 @@ pub const OpenAiCompatibleProvider = struct {
     /// Whether this provider supports native OpenAI-style tool_calls.
     /// When false, the agent uses XML tool format via system prompt.
     native_tools: bool = true,
+    /// Optional User-Agent header for HTTP requests.
+    /// When set, requests will include "User-Agent: {value}" header.
+    user_agent: ?[]const u8 = null,
     allocator: std.mem.Allocator,
 
     pub fn init(
@@ -75,12 +78,14 @@ pub const OpenAiCompatibleProvider = struct {
         base_url: []const u8,
         api_key: ?[]const u8,
         auth_style: AuthStyle,
+        user_agent: ?[]const u8,
     ) OpenAiCompatibleProvider {
         return .{
             .name = name,
             .base_url = trimTrailingSlash(base_url),
             .api_key = api_key,
             .auth_style = auth_style,
+            .user_agent = user_agent,
             .allocator = allocator,
         };
     }
@@ -465,7 +470,19 @@ pub const OpenAiCompatibleProvider = struct {
         else
             null;
 
-        return sse.curlStream(allocator, url, body, auth_hdr, &.{}, request.timeout_secs, callback, callback_ctx);
+        // Build extra headers (User-Agent if configured)
+        var extra_headers: [1][]const u8 = undefined;
+        var extra_header_count: usize = 0;
+        var user_agent_buf: [256]u8 = undefined;
+        if (self.user_agent) |ua| {
+            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
+            if (ua_header) |h| {
+                extra_headers[extra_header_count] = h;
+                extra_header_count += 1;
+            }
+        }
+
+        return sse.curlStream(allocator, url, body, auth_hdr, extra_headers[0..extra_header_count], request.timeout_secs, callback, callback_ctx);
     }
 
     fn supportsStreamingImpl(_: *anyopaque) bool {
@@ -506,11 +523,25 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const resp_body = if (auth) |a| blk: {
+        // Build headers (auth + optional User-Agent)
+        var headers_buf: [2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
-            break :blk root.curlPost(allocator, url, body, &.{auth_hdr}) catch return error.CompatibleApiError;
-        } else root.curlPost(allocator, url, body, &.{}) catch return error.CompatibleApiError;
+            headers_buf[header_count] = auth_hdr;
+            header_count += 1;
+        }
+        var user_agent_buf: [256]u8 = undefined;
+        if (self.user_agent) |ua| {
+            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
+            if (ua_header) |h| {
+                headers_buf[header_count] = h;
+                header_count += 1;
+            }
+        }
+
+        const resp_body = root.curlPost(allocator, url, body, headers_buf[0..header_count]) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
         return parseTextResponse(allocator, resp_body) catch |err| {
@@ -547,11 +578,25 @@ pub const OpenAiCompatibleProvider = struct {
             if (a.needs_free) allocator.free(a.value);
         };
 
-        const resp_body = if (auth) |a| blk: {
+        // Build headers (auth + optional User-Agent)
+        var headers_buf: [2][]const u8 = undefined;
+        var header_count: usize = 0;
+        if (auth) |a| {
             var auth_hdr_buf: [512]u8 = undefined;
             const auth_hdr = std.fmt.bufPrint(&auth_hdr_buf, "{s}: {s}", .{ a.name, a.value }) catch return error.CompatibleApiError;
-            break :blk root.curlPostTimed(allocator, url, body, &.{auth_hdr}, request.timeout_secs) catch return error.CompatibleApiError;
-        } else root.curlPostTimed(allocator, url, body, &.{}, request.timeout_secs) catch return error.CompatibleApiError;
+            headers_buf[header_count] = auth_hdr;
+            header_count += 1;
+        }
+        var user_agent_buf: [256]u8 = undefined;
+        if (self.user_agent) |ua| {
+            const ua_header = std.fmt.bufPrint(&user_agent_buf, "User-Agent: {s}", .{ua}) catch null;
+            if (ua_header) |h| {
+                headers_buf[header_count] = h;
+                header_count += 1;
+            }
+        }
+
+        const resp_body = root.curlPostTimed(allocator, url, body, headers_buf[0..header_count], request.timeout_secs) catch return error.CompatibleApiError;
         defer allocator.free(resp_body);
 
         return parseNativeResponse(allocator, resp_body) catch |err| {
@@ -728,12 +773,12 @@ fn buildStreamingChatRequestBody(
 // ════════════════════════════════════════════════════════════════════════════
 
 test "strips trailing slash" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com/", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com/", null, .bearer, null);
     try std.testing.expectEqualStrings("https://example.com", p.base_url);
 }
 
 test "chatCompletionsUrl standard" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.openai.com/v1", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.openai.com/v1", null, .bearer, null);
     const url = try p.chatCompletionsUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.openai.com/v1/chat/completions", url);
@@ -746,6 +791,7 @@ test "chatCompletionsUrl custom full endpoint" {
         "https://ark.cn-beijing.volces.com/api/coding/v3/chat/completions",
         null,
         .bearer,
+        null,
     );
     const url = try p.chatCompletionsUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
@@ -790,7 +836,7 @@ test "parseTextResponse classifies rate-limit errors" {
 }
 
 test "authHeaderValue bearer style" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "my-key", .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "my-key", .bearer, null);
     const auth = (try p.authHeaderValue(std.testing.allocator)).?;
     defer if (auth.needs_free) std.testing.allocator.free(auth.value);
     try std.testing.expectEqualStrings("authorization", auth.name);
@@ -798,7 +844,7 @@ test "authHeaderValue bearer style" {
 }
 
 test "authHeaderValue x-api-key style" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "my-key", .x_api_key);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "my-key", .x_api_key, null);
     const auth = (try p.authHeaderValue(std.testing.allocator)).?;
     defer if (auth.needs_free) std.testing.allocator.free(auth.value);
     try std.testing.expectEqualStrings("x-api-key", auth.name);
@@ -806,26 +852,26 @@ test "authHeaderValue x-api-key style" {
 }
 
 test "authHeaderValue no key" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", null, .bearer, null);
     try std.testing.expect(try p.authHeaderValue(std.testing.allocator) == null);
 }
 
 test "chatCompletionsUrl trailing slash stripped" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/v1/", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/v1/", null, .bearer, null);
     const url = try p.chatCompletionsUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.example.com/v1/chat/completions", url);
 }
 
 test "chatCompletionsUrl without v1" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com", null, .bearer, null);
     const url = try p.chatCompletionsUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.example.com/chat/completions", url);
 }
 
 test "chatCompletionsUrl with v1" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/v1", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/v1", null, .bearer, null);
     const url = try p.chatCompletionsUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.example.com/v1/chat/completions", url);
@@ -845,14 +891,14 @@ test "buildRequestBody without system" {
 }
 
 test "normalizeProviderModel maps DeepSeek v3.2 aliases to deepseek-chat" {
-    const deepseek = OpenAiCompatibleProvider.init(std.testing.allocator, "deepseek", "https://api.deepseek.com", null, .bearer);
+    const deepseek = OpenAiCompatibleProvider.init(std.testing.allocator, "deepseek", "https://api.deepseek.com", null, .bearer, null);
     try std.testing.expectEqualStrings("deepseek-chat", deepseek.normalizeProviderModel("deepseek-v3.2"));
     try std.testing.expectEqualStrings("deepseek-chat", deepseek.normalizeProviderModel("deepseek/deepseek-v3.2"));
     try std.testing.expectEqualStrings("deepseek-reasoner", deepseek.normalizeProviderModel("deepseek-reasoner"));
 }
 
 test "normalizeProviderModel leaves other providers unchanged" {
-    const openrouter = OpenAiCompatibleProvider.init(std.testing.allocator, "openrouter", "https://openrouter.ai/api/v1", null, .bearer);
+    const openrouter = OpenAiCompatibleProvider.init(std.testing.allocator, "openrouter", "https://openrouter.ai/api/v1", null, .bearer, null);
     try std.testing.expectEqualStrings("deepseek-v3.2", openrouter.normalizeProviderModel("deepseek-v3.2"));
 }
 
@@ -869,7 +915,7 @@ test "AuthStyle headerName" {
 }
 
 test "provider getName returns custom name" {
-    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "Venice", "https://api.venice.ai", "key", .bearer);
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "Venice", "https://api.venice.ai", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expectEqualStrings("Venice", prov.getName());
 }
@@ -881,6 +927,7 @@ test "chatCompletionsUrl requires exact suffix match" {
         "https://my-api.example.com/v2/llm/chat/completions-proxy",
         null,
         .bearer,
+        null,
     );
     const url = try p.chatCompletionsUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
@@ -888,7 +935,7 @@ test "chatCompletionsUrl requires exact suffix match" {
 }
 
 test "supportsNativeTools returns true for compatible" {
-    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer);
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsNativeTools());
 }
@@ -898,14 +945,14 @@ test "supportsNativeTools returns true for compatible" {
 // ════════════════════════════════════════════════════════════════════════════
 
 test "responsesUrl standard base" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com", null, .bearer, null);
     const url = try p.responsesUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.example.com/v1/responses", url);
 }
 
 test "responsesUrl with v1 no duplicate" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/v1", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/v1", null, .bearer, null);
     const url = try p.responsesUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.example.com/v1/responses", url);
@@ -918,6 +965,7 @@ test "responsesUrl derives from chat endpoint" {
         "https://my-api.example.com/api/v2/chat/completions",
         null,
         .bearer,
+        null,
     );
     const url = try p.responsesUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
@@ -931,6 +979,7 @@ test "responsesUrl custom full endpoint preserved" {
         "https://my-api.example.com/api/v2/responses",
         null,
         .bearer,
+        null,
     );
     const url = try p.responsesUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
@@ -938,7 +987,7 @@ test "responsesUrl custom full endpoint preserved" {
 }
 
 test "responsesUrl non-v1 api path uses raw suffix" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/api/coding/v3", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://api.example.com/api/coding/v3", null, .bearer, null);
     const url = try p.responsesUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
     try std.testing.expectEqualStrings("https://api.example.com/api/coding/v3/responses", url);
@@ -951,6 +1000,7 @@ test "responsesUrl requires exact suffix match" {
         "https://my-api.example.com/api/v2/responses-proxy",
         null,
         .bearer,
+        null,
     );
     const url = try p.responsesUrl(std.testing.allocator);
     defer std.testing.allocator.free(url);
@@ -1023,7 +1073,7 @@ test "AuthStyle custom headerName fallback" {
 }
 
 test "authHeaderValue custom style" {
-    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "custom", "https://api.example.com", "my-key", .custom);
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "custom", "https://api.example.com", "my-key", .custom, null);
     p.custom_header = "X-Custom-Key";
     const auth = (try p.authHeaderValue(std.testing.allocator)).?;
     defer if (auth.needs_free) std.testing.allocator.free(auth.value);
@@ -1033,7 +1083,7 @@ test "authHeaderValue custom style" {
 }
 
 test "authHeaderValue custom style without custom_header falls back" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "custom", "https://api.example.com", "my-key", .custom);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "custom", "https://api.example.com", "my-key", .custom, null);
     const auth = (try p.authHeaderValue(std.testing.allocator)).?;
     defer if (auth.needs_free) std.testing.allocator.free(auth.value);
     try std.testing.expectEqualStrings("authorization", auth.name);
@@ -1056,13 +1106,13 @@ test "buildStreamingChatRequestBody contains stream true" {
 }
 
 test "supportsStreaming returns true for compatible" {
-    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer);
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expect(prov.supportsStreaming());
 }
 
 test "vtable has stream_chat not null" {
-    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer);
+    var p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", "key", .bearer, null);
     const prov = p.provider();
     try std.testing.expect(prov.vtable.stream_chat != null);
 }
@@ -1313,7 +1363,7 @@ test "merge_system_into_user false keeps system messages" {
 }
 
 test "merge_system_into_user field defaults to false" {
-    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", null, .bearer);
+    const p = OpenAiCompatibleProvider.init(std.testing.allocator, "test", "https://example.com", null, .bearer, null);
     try std.testing.expect(!p.merge_system_into_user);
 }
 
