@@ -266,7 +266,13 @@ pub const SessionManager = struct {
         }
     }
 
-    fn shouldResetUsageLedger(self: *SessionManager, stat: std.fs.File.Stat, now_ts: i64) bool {
+    fn shouldResetUsageLedger(
+        self: *SessionManager,
+        stat: std.fs.File.Stat,
+        now_ts: i64,
+        pending_bytes: usize,
+        pending_lines: u64,
+    ) bool {
         const window_secs = self.usageWindowSeconds();
         if (window_secs > 0) {
             const started_at = self.usage_ledger_window_started_at;
@@ -274,10 +280,13 @@ pub const SessionManager = struct {
         }
 
         const max_bytes = self.config.diagnostics.token_usage_ledger_max_bytes;
-        if (max_bytes > 0 and stat.size >= max_bytes) return true;
+        if (max_bytes > 0) {
+            const projected = @as(u64, @intCast(stat.size)) + @as(u64, @intCast(pending_bytes));
+            if (projected > max_bytes) return true;
+        }
 
         const max_lines = self.config.diagnostics.token_usage_ledger_max_lines;
-        if (max_lines > 0 and self.usage_ledger_line_count >= max_lines) return true;
+        if (max_lines > 0 and self.usage_ledger_line_count + pending_lines > max_lines) return true;
 
         return false;
     }
@@ -300,7 +309,27 @@ pub const SessionManager = struct {
         const stat = file.stat() catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
 
-        if (self.shouldResetUsageLedger(stat, now_ts)) {
+        var record_line: ?[]u8 = null;
+        defer if (record_line) |line| self.allocator.free(line);
+
+        const enforce_max_bytes = self.config.diagnostics.token_usage_ledger_max_bytes > 0;
+        if (enforce_max_bytes) {
+            record_line = std.fmt.allocPrint(
+                self.allocator,
+                "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}\n",
+                .{
+                    record.ts,
+                    std.json.fmt(record.provider, .{}),
+                    std.json.fmt(record.model, .{}),
+                    record.usage.prompt_tokens,
+                    record.usage.completion_tokens,
+                    record.usage.total_tokens,
+                },
+            ) catch return;
+        }
+
+        const pending_bytes: usize = if (record_line) |line| line.len else 0;
+        if (self.shouldResetUsageLedger(stat, now_ts, pending_bytes, 1)) {
             file.close();
             file_needs_close = false;
             file = std.fs.createFileAbsolute(ledger_path, .{ .truncate = true, .read = true }) catch return;
@@ -315,17 +344,21 @@ pub const SessionManager = struct {
         var writer_buf: [1024]u8 = undefined;
         var file_writer = file.writer(&writer_buf);
         const w = &file_writer.interface;
-        w.print(
-            "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}\n",
-            .{
-                record.ts,
-                std.json.fmt(record.provider, .{}),
-                std.json.fmt(record.model, .{}),
-                record.usage.prompt_tokens,
-                record.usage.completion_tokens,
-                record.usage.total_tokens,
-            },
-        ) catch return;
+        if (record_line) |line| {
+            w.writeAll(line) catch return;
+        } else {
+            w.print(
+                "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d}}}\n",
+                .{
+                    record.ts,
+                    std.json.fmt(record.provider, .{}),
+                    std.json.fmt(record.model, .{}),
+                    record.usage.prompt_tokens,
+                    record.usage.completion_tokens,
+                    record.usage.total_tokens,
+                },
+            ) catch return;
+        }
         w.flush() catch {};
 
         if (self.usage_ledger_window_started_at == 0) {
@@ -799,6 +832,54 @@ test "usage ledger resets when window expires" {
     try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
     try testing.expect(std.mem.indexOf(u8, content, "\"ts\":11") != null);
     try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":4") != null);
+}
+
+test "usage ledger resets when byte limit would be exceeded" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 140;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 21,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 2, .total_tokens = 3 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 22,
+        .provider = "p2",
+        .model = "m2",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 3, .total_tokens = 5 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":22") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"total_tokens\":5") != null);
 }
 
 test "getOrCreate creates new session for unknown key" {

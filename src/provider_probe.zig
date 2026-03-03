@@ -64,13 +64,49 @@ fn providerRequiresApiKey(provider_name: []const u8, base_url: ?[]const u8) bool
     };
 }
 
-fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8) !void {
+fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8, timeout_secs: u64) !void {
     var child = std.process.Child.init(argv, allocator);
     child.stdin_behavior = .Ignore;
     child.stdout_behavior = .Ignore;
     child.stderr_behavior = .Ignore;
     try child.spawn();
-    const term = try child.wait();
+
+    var finished = std.atomic.Value(bool).init(false);
+    var timed_out = std.atomic.Value(bool).init(false);
+
+    const WatchdogCtx = struct {
+        finished: *std.atomic.Value(bool),
+        timed_out: *std.atomic.Value(bool),
+        child: *std.process.Child,
+        timeout_secs: u64,
+    };
+    const watchdog = struct {
+        fn run(ctx: WatchdogCtx) void {
+            if (ctx.timeout_secs == 0) return;
+            std.Thread.sleep(ctx.timeout_secs * std.time.ns_per_s);
+            if (ctx.finished.load(.acquire)) return;
+            ctx.timed_out.store(true, .release);
+            _ = ctx.child.kill() catch {};
+        }
+    };
+
+    const watchdog_thread: ?std.Thread = if (timeout_secs > 0)
+        (std.Thread.spawn(.{}, watchdog.run, .{WatchdogCtx{
+            .finished = &finished,
+            .timed_out = &timed_out,
+            .child = &child,
+            .timeout_secs = timeout_secs,
+        }}) catch null)
+    else
+        null;
+    defer if (watchdog_thread) |t| t.join();
+
+    const term = child.wait() catch |err| {
+        finished.store(true, .release);
+        return err;
+    };
+    finished.store(true, .release);
+    if (timed_out.load(.acquire)) return error.ComponentProbeTimeout;
     switch (term) {
         .Exited => |code| if (code != 0) return error.CliProcessFailed,
         else => return error.CliProcessFailed,
@@ -79,6 +115,7 @@ fn runCommandProbe(allocator: std.mem.Allocator, argv: []const []const u8) !void
 
 fn classifyProbeError(err: anyerror) struct { reason: []const u8, status_code: ?u16 } {
     if (err == error.FileNotFound) return .{ .reason = "component_binary_missing", .status_code = 404 };
+    if (err == error.ComponentProbeTimeout) return .{ .reason = "probe_timeout", .status_code = 504 };
     if (err == error.CliProcessFailed) return .{ .reason = "component_probe_failed", .status_code = null };
     if (err == error.RateLimited) return .{ .reason = "rate_limited", .status_code = 429 };
     if (err == error.ApiError or err == error.ProviderError) {
@@ -110,14 +147,28 @@ fn probeCliProvider(
     kind: providers.ProviderKind,
     provider: []const u8,
     model: []const u8,
+    timeout_secs: u64,
 ) ProbeResult {
     const argv = switch (kind) {
-        .claude_cli_provider => &[_][]const u8{ "claude", "--version" },
-        .codex_cli_provider => &[_][]const u8{ "codex", "--version" },
+        .claude_cli_provider => &[_][]const u8{
+            "claude",
+            "-p",
+            "health",
+            "--output-format",
+            "stream-json",
+            "--model",
+            model,
+            "--verbose",
+        },
+        .codex_cli_provider => &[_][]const u8{
+            "codex",
+            "--quiet",
+            "health",
+        },
         else => unreachable,
     };
 
-    runCommandProbe(allocator, argv) catch |err| {
+    runCommandProbe(allocator, argv, timeout_secs) catch |err| {
         const classified = classifyProbeError(err);
         return .{
             .provider = provider,
@@ -257,7 +308,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     if (provider_kind == .claude_cli_provider or provider_kind == .codex_cli_provider) {
-        try writeProbeResult(probeCliProvider(allocator, provider_kind, provider, model));
+        try writeProbeResult(probeCliProvider(allocator, provider_kind, provider, model, timeout_secs));
         return;
     }
 
@@ -325,4 +376,10 @@ test "classifyProbeError maps missing binary" {
     const classified = classifyProbeError(error.FileNotFound);
     try std.testing.expectEqualStrings("component_binary_missing", classified.reason);
     try std.testing.expectEqual(@as(?u16, 404), classified.status_code);
+}
+
+test "classifyProbeError maps probe timeout" {
+    const classified = classifyProbeError(error.ComponentProbeTimeout);
+    try std.testing.expectEqualStrings("probe_timeout", classified.reason);
+    try std.testing.expectEqual(@as(?u16, 504), classified.status_code);
 }
