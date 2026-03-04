@@ -309,27 +309,22 @@ pub const SessionManager = struct {
         const stat = file.stat() catch return;
         self.initializeUsageLedgerState(&file, stat, now_ts);
 
-        var record_line: ?[]u8 = null;
-        defer if (record_line) |line| self.allocator.free(line);
+        const record_line = std.fmt.allocPrint(
+            self.allocator,
+            "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
+            .{
+                record.ts,
+                std.json.fmt(record.provider, .{}),
+                std.json.fmt(record.model, .{}),
+                record.usage.prompt_tokens,
+                record.usage.completion_tokens,
+                record.usage.total_tokens,
+                record.success,
+            },
+        ) catch return;
+        defer self.allocator.free(record_line);
 
-        const enforce_max_bytes = self.config.diagnostics.token_usage_ledger_max_bytes > 0;
-        if (enforce_max_bytes) {
-            record_line = std.fmt.allocPrint(
-                self.allocator,
-                "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
-                .{
-                    record.ts,
-                    std.json.fmt(record.provider, .{}),
-                    std.json.fmt(record.model, .{}),
-                    record.usage.prompt_tokens,
-                    record.usage.completion_tokens,
-                    record.usage.total_tokens,
-                    record.success,
-                },
-            ) catch return;
-        }
-
-        const pending_bytes: usize = if (record_line) |line| line.len else 0;
+        const pending_bytes: usize = record_line.len;
         if (self.shouldResetUsageLedger(stat, now_ts, pending_bytes, 1)) {
             file.close();
             file_needs_close = false;
@@ -340,28 +335,10 @@ pub const SessionManager = struct {
             self.usage_ledger_line_count = 0;
         }
 
-        file.seekFromEnd(0) catch {};
-
-        var writer_buf: [1024]u8 = undefined;
-        var file_writer = file.writer(&writer_buf);
-        const w = &file_writer.interface;
-        if (record_line) |line| {
-            w.writeAll(line) catch return;
-        } else {
-            w.print(
-                "{{\"ts\":{d},\"provider\":{f},\"model\":{f},\"prompt_tokens\":{d},\"completion_tokens\":{d},\"total_tokens\":{d},\"success\":{}}}\n",
-                .{
-                    record.ts,
-                    std.json.fmt(record.provider, .{}),
-                    std.json.fmt(record.model, .{}),
-                    record.usage.prompt_tokens,
-                    record.usage.completion_tokens,
-                    record.usage.total_tokens,
-                    record.success,
-                },
-            ) catch return;
-        }
-        w.flush() catch {};
+        // Zig 0.15 buffered File.writer ignores manual seek position for append-style writes.
+        // Use direct file.writeAll after seek to guarantee true append semantics.
+        file.seekFromEnd(0) catch return;
+        file.writeAll(record_line) catch return;
 
         if (self.usage_ledger_window_started_at == 0) {
             self.usage_ledger_window_started_at = now_ts;
@@ -727,6 +704,54 @@ test "SessionManager init/deinit — no leaks" {
     const cfg = testConfig();
     var sm = testSessionManager(testing.allocator, &mock, &cfg);
     sm.deinit();
+}
+
+test "usage ledger appends records when retention limits are disabled" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const base = try tmp.dir.realpathAlloc(testing.allocator, ".");
+    defer testing.allocator.free(base);
+    const config_path = try std.fmt.allocPrint(testing.allocator, "{s}/config.json", .{base});
+    defer testing.allocator.free(config_path);
+    const ledger_path = try std.fmt.allocPrint(testing.allocator, "{s}/{s}", .{ base, TOKEN_USAGE_LEDGER_FILENAME });
+    defer testing.allocator.free(ledger_path);
+
+    var cfg = testConfig();
+    cfg.workspace_dir = base;
+    cfg.config_path = config_path;
+    cfg.diagnostics.token_usage_ledger_enabled = true;
+    cfg.diagnostics.token_usage_ledger_window_hours = 0;
+    cfg.diagnostics.token_usage_ledger_max_lines = 0;
+    cfg.diagnostics.token_usage_ledger_max_bytes = 0;
+
+    var mock = MockProvider{ .response = "ok" };
+    var sm = testSessionManager(testing.allocator, &mock, &cfg);
+    defer sm.deinit();
+
+    sm.appendUsageRecord(.{
+        .ts = 101,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 1, .completion_tokens = 1, .total_tokens = 2 },
+        .success = true,
+    });
+    sm.appendUsageRecord(.{
+        .ts = 102,
+        .provider = "p1",
+        .model = "m1",
+        .usage = .{ .prompt_tokens = 2, .completion_tokens = 2, .total_tokens = 4 },
+        .success = true,
+    });
+
+    const file = try std.fs.openFileAbsolute(ledger_path, .{});
+    defer file.close();
+    const content = try file.readToEndAlloc(testing.allocator, 64 * 1024);
+    defer testing.allocator.free(content);
+
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, content, "\n"));
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":101") != null);
+    try testing.expect(std.mem.indexOf(u8, content, "\"ts\":102") != null);
 }
 
 test "usage ledger resets when max line limit is reached" {

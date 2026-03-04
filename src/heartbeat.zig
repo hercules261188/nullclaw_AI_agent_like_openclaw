@@ -1,5 +1,7 @@
 const std = @import("std");
 const observability = @import("observability.zig");
+const bootstrap_mod = @import("bootstrap/root.zig");
+const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 
 pub const TickOutcome = enum {
     processed,
@@ -18,6 +20,7 @@ pub const HeartbeatEngine = struct {
     interval_minutes: u32,
     workspace_dir: []const u8,
     observer: ?observability.Observer,
+    bootstrap_provider: ?BootstrapProvider = null,
 
     pub fn init(enabled: bool, interval_minutes: u32, workspace_dir: []const u8, observer: ?observability.Observer) HeartbeatEngine {
         return .{
@@ -52,6 +55,18 @@ pub const HeartbeatEngine = struct {
 
     /// Collect tasks from the HEARTBEAT.md file in the workspace.
     pub fn collectTasks(self: *const HeartbeatEngine, allocator: std.mem.Allocator) ![][]const u8 {
+        // Try bootstrap provider first when available.
+        if (self.bootstrap_provider) |bp| {
+            const bp_content = bp.load(allocator, "HEARTBEAT.md") catch null;
+            if (bp_content) |content| {
+                defer allocator.free(content);
+                if (isContentEffectivelyEmpty(content)) return &.{};
+                return parseTasks(allocator, content);
+            }
+            return &.{};
+        }
+
+        // Fallback: direct file read.
         const heartbeat_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, "HEARTBEAT.md" });
         defer allocator.free(heartbeat_path);
 
@@ -88,6 +103,22 @@ pub const HeartbeatEngine = struct {
 
     /// Perform a single heartbeat tick.
     pub fn tick(self: *const HeartbeatEngine, allocator: std.mem.Allocator) !TickResult {
+        // Try bootstrap provider first when available.
+        if (self.bootstrap_provider) |bp| {
+            const bp_content = bp.load(allocator, "HEARTBEAT.md") catch null;
+            if (bp_content) |content| {
+                defer allocator.free(content);
+                if (isContentEffectivelyEmpty(content)) {
+                    return .{ .outcome = .skipped_empty_file, .task_count = 0 };
+                }
+                const tasks = try self.collectTasks(allocator);
+                defer freeTasks(allocator, tasks);
+                return .{ .outcome = .processed, .task_count = tasks.len };
+            }
+            return .{ .outcome = .skipped_missing_file, .task_count = 0 };
+        }
+
+        // Fallback: direct file read.
         const heartbeat_path = try std.fs.path.join(allocator, &.{ self.workspace_dir, "HEARTBEAT.md" });
         defer allocator.free(heartbeat_path);
 

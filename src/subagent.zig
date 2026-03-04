@@ -50,6 +50,7 @@ pub const TaskRunRequest = struct {
     http_allowed_domains: []const []const u8,
     http_max_response_size: u32,
     tools_config: config_types.ToolsConfig,
+    memory_config: config_types.MemoryConfig,
     max_tool_iterations: u32,
     autonomy: config_types.AutonomyLevel,
     workspace_only: bool,
@@ -102,6 +103,7 @@ pub const SubagentManager = struct {
     http_allowed_domains: []const []const u8,
     http_max_response_size: u32,
     tools_config: config_types.ToolsConfig,
+    memory_config: config_types.MemoryConfig,
     task_runner: ?TaskRunnerFn = null,
 
     pub fn init(
@@ -134,6 +136,7 @@ pub const SubagentManager = struct {
             .http_allowed_domains = cfg.http_request.allowed_domains,
             .http_max_response_size = cfg.http_request.max_response_size,
             .tools_config = cfg.tools,
+            .memory_config = cfg.memory,
         };
     }
 
@@ -373,6 +376,7 @@ fn subagentThreadFn(ctx: *ThreadContext) void {
             .http_allowed_domains = ctx.manager.http_allowed_domains,
             .http_max_response_size = ctx.manager.http_max_response_size,
             .tools_config = ctx.manager.tools_config,
+            .memory_config = ctx.manager.memory_config,
             .max_tool_iterations = ctx.manager.config.max_iterations,
             .autonomy = ctx.manager.autonomy,
             .workspace_only = ctx.manager.workspace_only,

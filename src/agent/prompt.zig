@@ -4,6 +4,8 @@ const platform = @import("../platform.zig");
 const tools_mod = @import("../tools/root.zig");
 const Tool = tools_mod.Tool;
 const skills_mod = @import("../skills.zig");
+const bootstrap_mod = @import("../bootstrap/root.zig");
+const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 
 // ═══════════════════════════════════════════════════════════════════════════
 // System Prompt Builder
@@ -122,6 +124,7 @@ pub const PromptContext = struct {
     tools: []const Tool,
     capabilities_section: ?[]const u8 = null,
     conversation_context: ?ConversationContext = null,
+    bootstrap_provider: ?BootstrapProvider = null,
 };
 
 /// Build a lightweight fingerprint for workspace prompt files.
@@ -129,7 +132,14 @@ pub const PromptContext = struct {
 pub fn workspacePromptFingerprint(
     allocator: std.mem.Allocator,
     workspace_dir: []const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) !u64 {
+    // When a bootstrap provider is available, delegate fingerprinting to it.
+    if (bootstrap_provider) |bp| {
+        return bp.fingerprint(allocator);
+    }
+
+    // Fallback: file-based fingerprinting.
     var hasher = std.hash.Fnv1a_64.init();
     const tracked_files = [_][]const u8{
         "AGENTS.md",
@@ -187,7 +197,7 @@ pub fn buildSystemPrompt(
     const w = buf.writer(allocator);
 
     // Identity section — inject workspace MD files
-    try buildIdentitySection(allocator, w, ctx.workspace_dir);
+    try buildIdentitySection(allocator, w, ctx.workspace_dir, ctx.bootstrap_provider);
 
     // Tools section
     try buildToolsSection(w, ctx.tools);
@@ -299,6 +309,7 @@ fn buildIdentitySection(
     allocator: std.mem.Allocator,
     w: anytype,
     workspace_dir: []const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) !void {
     try w.writeAll("## Project Context\n\n");
     try w.writeAll("The following workspace files define your identity, behavior, and context.\n\n");
@@ -317,11 +328,11 @@ fn buildIdentitySection(
     };
 
     for (identity_files) |filename| {
-        try injectWorkspaceFile(allocator, w, workspace_dir, filename);
+        try injectWorkspaceFile(allocator, w, workspace_dir, filename, bootstrap_provider);
     }
 
     // Inject MEMORY.md if present, otherwise fallback to memory.md.
-    try injectPreferredMemoryFile(allocator, w, workspace_dir);
+    try injectPreferredMemoryFile(allocator, w, workspace_dir, bootstrap_provider);
 }
 
 test "buildSystemPrompt includes SOUL persona guidance" {
@@ -576,7 +587,20 @@ fn injectWorkspaceFile(
     w: anytype,
     workspace_dir: []const u8,
     filename: []const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) !void {
+    // Try bootstrap provider first when available.
+    if (bootstrap_provider) |bp| {
+        const content = bp.load(allocator, filename) catch null;
+        if (content) |c| {
+            defer allocator.free(c);
+            try appendPromptSectionContent(w, filename, c);
+            return;
+        }
+        // Provider returned null — fall through to file-based path.
+    }
+
+    // Fallback: direct file read.
     const opened = openWorkspaceFileWithGuards(allocator, workspace_dir, filename);
     if (opened == null) {
         try std.fmt.format(w, "### {s}\n\n[File not found: {s}]\n\n", .{ filename, filename });
@@ -627,7 +651,23 @@ fn injectPreferredMemoryFile(
     allocator: std.mem.Allocator,
     w: anytype,
     workspace_dir: []const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) !void {
+    // When bootstrap provider is available, try loading MEMORY.md through it.
+    if (bootstrap_provider) |bp| {
+        const memory_files = [_][]const u8{ "MEMORY.md", "memory.md" };
+        for (memory_files) |filename| {
+            const content = bp.load(allocator, filename) catch null;
+            if (content) |c| {
+                defer allocator.free(c);
+                try appendPromptSectionContent(w, filename, c);
+                return; // Found via provider, done.
+            }
+        }
+        // Provider returned null for all variants — fall through to file-based path.
+    }
+
+    // Fallback: direct file-based injection.
     var seen_memory_paths: std.StringHashMapUnmanaged(void) = .empty;
     defer {
         var it = seen_memory_paths.keyIterator();
@@ -892,8 +932,8 @@ test "workspacePromptFingerprint is stable when files are unchanged" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace);
-    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const fp1 = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
+    const fp2 = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expectEqual(fp1, fp2);
 }
 
@@ -910,7 +950,7 @@ test "workspacePromptFingerprint changes when tracked file changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("SOUL.md", .{ .truncate = true });
@@ -918,7 +958,7 @@ test "workspacePromptFingerprint changes when tracked file changes" {
         try f.writeAll("longer-content-after-change");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -935,7 +975,7 @@ test "workspacePromptFingerprint changes when MEMORY.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("MEMORY.md", .{ .truncate = true });
@@ -943,7 +983,7 @@ test "workspacePromptFingerprint changes when MEMORY.md changes" {
         try f.writeAll("memory-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -960,7 +1000,7 @@ test "workspacePromptFingerprint changes when memory.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("memory.md", .{ .truncate = true });
@@ -968,7 +1008,7 @@ test "workspacePromptFingerprint changes when memory.md changes" {
         try f.writeAll("alt-memory-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -985,7 +1025,7 @@ test "workspacePromptFingerprint changes when BOOTSTRAP.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("BOOTSTRAP.md", .{ .truncate = true });
@@ -993,7 +1033,7 @@ test "workspacePromptFingerprint changes when BOOTSTRAP.md changes" {
         try f.writeAll("bootstrap-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -1010,7 +1050,7 @@ test "workspacePromptFingerprint changes when HEARTBEAT.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("HEARTBEAT.md", .{ .truncate = true });
@@ -1018,7 +1058,7 @@ test "workspacePromptFingerprint changes when HEARTBEAT.md changes" {
         try f.writeAll("- check-2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -1035,7 +1075,7 @@ test "workspacePromptFingerprint changes when IDENTITY.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("IDENTITY.md", .{ .truncate = true });
@@ -1043,7 +1083,7 @@ test "workspacePromptFingerprint changes when IDENTITY.md changes" {
         try f.writeAll("- **Name:** v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -1060,7 +1100,7 @@ test "workspacePromptFingerprint changes when AGENTS.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("AGENTS.md", .{ .truncate = true });
@@ -1068,7 +1108,7 @@ test "workspacePromptFingerprint changes when AGENTS.md changes" {
         try f.writeAll("startup-v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 
@@ -1085,7 +1125,7 @@ test "workspacePromptFingerprint changes when USER.md changes" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const before = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const before = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
 
     {
         const f = try tmp.dir.createFile("USER.md", .{ .truncate = true });
@@ -1093,7 +1133,7 @@ test "workspacePromptFingerprint changes when USER.md changes" {
         try f.writeAll("- **Name:** v2-updated");
     }
 
-    const after = try workspacePromptFingerprint(std.testing.allocator, workspace);
+    const after = try workspacePromptFingerprint(std.testing.allocator, workspace, null);
     try std.testing.expect(before != after);
 }
 

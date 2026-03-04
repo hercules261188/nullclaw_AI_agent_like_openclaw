@@ -1163,6 +1163,25 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk std.time.timestamp() + 60;
         };
+        const last_run_secs: ?i64 = blk: {
+            if (obj.get("last_run_secs")) |v| {
+                if (v == .integer) break :blk v.integer;
+                if (v == .null) break :blk null;
+            }
+            break :blk null;
+        };
+        const last_status = blk: {
+            if (obj.get("last_status")) |v| {
+                if (v == .string and v.string.len > 0) {
+                    if (std.mem.eql(u8, v.string, "ok")) break :blk "ok";
+                    if (std.mem.eql(u8, v.string, "error")) break :blk "error";
+                    // Backward-compat aliases from older payloads.
+                    if (std.mem.eql(u8, v.string, "success")) break :blk "ok";
+                    if (std.mem.eql(u8, v.string, "failed")) break :blk "error";
+                }
+            }
+            break :blk null;
+        };
 
         const paused = blk: {
             if (obj.get("paused")) |v| {
@@ -1239,6 +1258,8 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .expression = try scheduler.allocator.dupe(u8, expression),
             .command = try scheduler.allocator.dupe(u8, command),
             .next_run_secs = next_run_secs,
+            .last_run_secs = last_run_secs,
+            .last_status = last_status,
             .paused = paused,
             .one_shot = one_shot,
             .job_type = job_type,
@@ -1621,6 +1642,18 @@ pub fn cliResumeJob(allocator: std.mem.Allocator, id: []const u8) !void {
     }
 }
 
+fn resolveRunnableCwd(cwd_opt: ?[]const u8) ?[]const u8 {
+    const cwd = cwd_opt orelse return null;
+    if (cwd.len == 0) return null;
+
+    if (std.fs.path.isAbsolute(cwd)) {
+        std.fs.accessAbsolute(cwd, .{}) catch return null;
+    } else {
+        std.fs.cwd().access(cwd, .{}) catch return null;
+    }
+    return cwd;
+}
+
 pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
     var cfg_opt: ?Config = Config.load(allocator) catch null;
     defer if (cfg_opt) |*cfg| cfg.deinit();
@@ -1632,16 +1665,24 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
         scheduler.setAgentTimeoutSecs(cfg.scheduler.agent_timeout_secs);
     }
     try loadJobs(&scheduler);
+    const run_cwd = resolveRunnableCwd(scheduler.shell_cwd);
+    if (scheduler.shell_cwd != null and run_cwd == null) {
+        log.warn("Cron shell cwd is unavailable; falling back to process cwd for manual run.", .{});
+    }
 
-    if (scheduler.getJob(id)) |job| {
+    if (scheduler.getMutableJob(id)) |job| {
         log.info("Running job '{s}': {s}", .{ id, job.command });
+        const run_at = std.time.timestamp();
         switch (job.job_type) {
             .shell => {
                 const result = std.process.Child.run(.{
                     .allocator = allocator,
                     .argv = &.{ platform.getShell(), platform.getShellFlag(), job.command },
-                    .cwd = scheduler.shell_cwd,
+                    .cwd = run_cwd,
                 }) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
                     log.err("Job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
@@ -1652,16 +1693,25 @@ pub fn cliRunJob(allocator: std.mem.Allocator, id: []const u8) !void {
                     .Exited => |code| code,
                     else => 1,
                 };
+                job.last_run_secs = run_at;
+                job.last_status = if (exit_code == 0) "ok" else "error";
+                try saveJobs(&scheduler);
                 log.info("Job '{s}' completed (exit {d}).", .{ id, exit_code });
             },
             .agent => {
                 const prompt = job.prompt orelse job.command;
-                const result = runAgentJob(allocator, scheduler.shell_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
+                const result = runAgentJob(allocator, run_cwd, prompt, job.model, scheduler.agent_timeout_secs) catch |err| {
+                    job.last_run_secs = run_at;
+                    job.last_status = "error";
+                    try saveJobs(&scheduler);
                     log.err("Agent job '{s}' failed: {s}", .{ id, @errorName(err) });
                     return;
                 };
                 defer allocator.free(result.output);
                 if (result.output.len > 0) log.info("{s}", .{result.output});
+                job.last_run_secs = run_at;
+                job.last_status = if (result.success) "ok" else "error";
+                try saveJobs(&scheduler);
                 log.info("Agent job '{s}' completed ({s}).", .{ id, if (result.success) "ok" else "error" });
             },
         }
@@ -1950,7 +2000,13 @@ test "save and load roundtrip" {
     var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
     defer scheduler.deinit();
 
-    _ = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    const recurring = try scheduler.addJob("*/10 * * * *", "echo roundtrip");
+    if (scheduler.getMutableJob(recurring.id)) |job| {
+        job.last_run_secs = 1_772_455_140;
+        job.last_status = "ok";
+    } else {
+        return error.TestUnexpectedResult;
+    }
     _ = try scheduler.addOnce("5m", "echo oneshot");
 
     // Save to disk
@@ -1966,7 +2022,42 @@ test "save and load roundtrip" {
     const loaded = scheduler2.listJobs();
     try std.testing.expectEqualStrings("*/10 * * * *", loaded[0].expression);
     try std.testing.expectEqualStrings("echo roundtrip", loaded[0].command);
+    try std.testing.expectEqual(@as(?i64, 1_772_455_140), loaded[0].last_run_secs);
+    try std.testing.expect(loaded[0].last_status != null);
+    try std.testing.expectEqualStrings("ok", loaded[0].last_status.?);
     try std.testing.expect(loaded[1].one_shot);
+}
+
+test "cliRunJob persists last status and timestamp" {
+    var scheduler = CronScheduler.init(std.testing.allocator, 10, true);
+    defer scheduler.deinit();
+
+    const job = try scheduler.addJob("* * * * *", "echo cli_run_status");
+    const job_id = try std.testing.allocator.dupe(u8, job.id);
+    defer std.testing.allocator.free(job_id);
+    try saveJobs(&scheduler);
+
+    try cliRunJob(std.testing.allocator, job_id);
+
+    var loaded = CronScheduler.init(std.testing.allocator, 10, true);
+    defer loaded.deinit();
+    try loadJobsStrict(&loaded);
+
+    const loaded_job = loaded.getJob(job_id) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(loaded_job.last_run_secs != null);
+    try std.testing.expect(loaded_job.last_status != null);
+    try std.testing.expectEqualStrings("ok", loaded_job.last_status.?);
+}
+
+test "resolveRunnableCwd keeps valid cwd" {
+    const resolved = resolveRunnableCwd(".");
+    try std.testing.expect(resolved != null);
+    try std.testing.expectEqualStrings(".", resolved.?);
+}
+
+test "resolveRunnableCwd returns null for missing cwd" {
+    const resolved = resolveRunnableCwd("__nullclaw_missing_cwd_for_cron_tests__/subdir");
+    try std.testing.expect(resolved == null);
 }
 
 test "reloadJobs auto-recovers malformed store and keeps runtime jobs" {

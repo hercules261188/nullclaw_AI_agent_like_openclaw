@@ -36,6 +36,10 @@ pub const SandboxBackend = enum {
 
 pub const ProviderEntry = struct {
     name: []const u8,
+    /// Provider credential payload.
+    /// Usually a string API key/token.
+    /// For providers that support structured credentials (e.g. Vertex service-account JSON),
+    /// the parser accepts object/array JSON and stores it as a compact JSON string.
     api_key: ?[]const u8 = null,
     base_url: ?[]const u8 = null,
     /// Whether this provider supports native OpenAI-style tool_calls.
@@ -693,6 +697,8 @@ pub const ChannelsConfig = struct {
 
 /// Memory configuration profile presets.
 pub const MemoryProfile = enum {
+    /// Hybrid: SQLite backend with workspace bootstrap files.
+    hybrid_keyword,
     /// SQLite keyword-only (default).
     local_keyword,
     /// File-based markdown memory.
@@ -709,6 +715,7 @@ pub const MemoryProfile = enum {
     custom,
 
     pub fn fromString(s: []const u8) MemoryProfile {
+        if (std.mem.eql(u8, s, "hybrid_keyword")) return .hybrid_keyword;
         if (std.mem.eql(u8, s, "local_keyword")) return .local_keyword;
         if (std.mem.eql(u8, s, "markdown_only")) return .markdown_only;
         if (std.mem.eql(u8, s, "postgres_keyword")) return .postgres_keyword;
@@ -720,11 +727,12 @@ pub const MemoryProfile = enum {
 };
 
 pub const MemoryConfig = struct {
-    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "markdown";
+    pub const DEFAULT_MEMORY_BACKEND: []const u8 = "hybrid";
 
     /// Profile preset — convenience shortcut for common setups.
-    profile: []const u8 = "markdown_only",
+    profile: []const u8 = "hybrid_keyword",
     backend: []const u8 = DEFAULT_MEMORY_BACKEND,
+    instance_id: []const u8 = "",
     auto_save: bool = true,
     citations: []const u8 = "auto",
     search: MemorySearchConfig = .{},
@@ -743,6 +751,9 @@ pub const MemoryConfig = struct {
     pub fn applyProfileDefaults(self: *MemoryConfig) void {
         const p = MemoryProfile.fromString(self.profile);
         switch (p) {
+            .hybrid_keyword => {
+                // Base default is already hybrid.
+            },
             .local_keyword => {
                 if (std.mem.eql(u8, self.backend, DEFAULT_MEMORY_BACKEND)) self.backend = "sqlite";
             },
@@ -899,6 +910,7 @@ pub const MemoryLifecycleConfig = struct {
     hygiene_enabled: bool = true,
     archive_after_days: u32 = 7,
     purge_after_days: u32 = 30,
+    preserve_before_purge: bool = true,
     conversation_retention_days: u32 = 30,
     snapshot_enabled: bool = false,
     snapshot_on_hygiene: bool = false,

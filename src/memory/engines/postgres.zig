@@ -89,6 +89,7 @@ const PostgresMemoryImpl = struct {
     owns_self: bool = false,
     schema_q: []const u8, // validated+quoted schema name
     table_q: []const u8, // validated+quoted table name
+    instance_id: []const u8 = "",
 
     // Pre-built query templates
     q_store: []const u8,
@@ -109,7 +110,7 @@ const PostgresMemoryImpl = struct {
 
     const Self = @This();
 
-    pub fn init(allocator: std.mem.Allocator, url: [*:0]const u8, schema: []const u8, table: []const u8) !Self {
+    pub fn init(allocator: std.mem.Allocator, url: [*:0]const u8, schema: []const u8, table: []const u8, instance_id: []const u8) !Self {
         try validateIdentifier(schema);
         try validateIdentifier(table);
 
@@ -130,6 +131,7 @@ const PostgresMemoryImpl = struct {
             .allocator = allocator,
             .schema_q = schema_q,
             .table_q = table_q,
+            .instance_id = instance_id,
             .q_store = undefined,
             .q_get = undefined,
             .q_list_cat = undefined,
@@ -148,32 +150,33 @@ const PostgresMemoryImpl = struct {
         };
 
         // Build query templates
-        self_.q_store = try buildQuery(allocator, "INSERT INTO {schema}.{table} (id, key, content, category, session_id, created_at, updated_at) " ++
-            "VALUES ($1, $2, $3, $4, $5, $6, $7) " ++
-            "ON CONFLICT (key) DO UPDATE SET content = EXCLUDED.content, category = EXCLUDED.category, " ++
+        // instance_id filtering is always included; empty string matches the default column value.
+        self_.q_store = try buildQuery(allocator, "INSERT INTO {schema}.{table} (id, key, content, category, session_id, instance_id, created_at, updated_at) " ++
+            "VALUES ($1, $2, $3, $4, $5, $6, $7, $8) " ++
+            "ON CONFLICT (key, instance_id) DO UPDATE SET content = EXCLUDED.content, category = EXCLUDED.category, " ++
             "session_id = EXCLUDED.session_id, updated_at = EXCLUDED.updated_at", schema_q, table_q);
         errdefer allocator.free(self_.q_store);
 
-        self_.q_get = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE key = $1", schema_q, table_q);
+        self_.q_get = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE key = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_get);
 
-        self_.q_list_cat = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 ORDER BY updated_at DESC", schema_q, table_q);
+        self_.q_list_cat = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 AND instance_id = $2 ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_cat);
 
-        self_.q_list_all = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} ORDER BY updated_at DESC", schema_q, table_q);
+        self_.q_list_all = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE instance_id = $1 ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_all);
 
         self_.q_recall = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, " ++
             "CASE WHEN key ILIKE $1 THEN 2.0 ELSE 0.0 END + " ++
             "CASE WHEN content ILIKE $1 THEN 1.0 ELSE 0.0 END AS score " ++
-            "FROM {schema}.{table} WHERE key ILIKE $1 OR content ILIKE $1 " ++
+            "FROM {schema}.{table} WHERE (key ILIKE $1 OR content ILIKE $1) AND instance_id = $3 " ++
             "ORDER BY score DESC LIMIT $2", schema_q, table_q);
         errdefer allocator.free(self_.q_recall);
 
-        self_.q_forget = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key = $1", schema_q, table_q);
+        self_.q_forget = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_forget);
 
-        self_.q_count = try buildQuery(allocator, "SELECT COUNT(*) FROM {schema}.{table}", schema_q, table_q);
+        self_.q_count = try buildQuery(allocator, "SELECT COUNT(*) FROM {schema}.{table} WHERE instance_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_count);
 
         self_.q_save_msg = try buildQuery(allocator, "INSERT INTO {schema}.messages (session_id, role, content) VALUES ($1, $2, $3)", schema_q, table_q);
@@ -185,23 +188,23 @@ const PostgresMemoryImpl = struct {
         self_.q_clear_msgs = try buildQuery(allocator, "DELETE FROM {schema}.messages WHERE session_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_msgs);
 
-        self_.q_clear_auto = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%'", schema_q, table_q);
+        self_.q_clear_auto = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%' AND instance_id = $1", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_auto);
 
-        self_.q_clear_auto_sid = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%' AND session_id = $1", schema_q, table_q);
+        self_.q_clear_auto_sid = try buildQuery(allocator, "DELETE FROM {schema}.{table} WHERE key LIKE 'autosave_%' AND session_id = $1 AND instance_id = $2", schema_q, table_q);
         errdefer allocator.free(self_.q_clear_auto_sid);
 
         self_.q_recall_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id, " ++
             "CASE WHEN key ILIKE $1 THEN 2.0 ELSE 0.0 END + " ++
             "CASE WHEN content ILIKE $1 THEN 1.0 ELSE 0.0 END AS score " ++
-            "FROM {schema}.{table} WHERE (key ILIKE $1 OR content ILIKE $1) AND session_id = $3 " ++
+            "FROM {schema}.{table} WHERE (key ILIKE $1 OR content ILIKE $1) AND session_id = $3 AND instance_id = $4 " ++
             "ORDER BY score DESC LIMIT $2", schema_q, table_q);
         errdefer allocator.free(self_.q_recall_sid);
 
-        self_.q_list_cat_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 AND session_id = $2 ORDER BY updated_at DESC", schema_q, table_q);
+        self_.q_list_cat_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE category = $1 AND session_id = $2 AND instance_id = $3 ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_cat_sid);
 
-        self_.q_list_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE session_id = $1 ORDER BY updated_at DESC", schema_q, table_q);
+        self_.q_list_sid = try buildQuery(allocator, "SELECT id, key, content, category, updated_at, session_id FROM {schema}.{table} WHERE session_id = $1 AND instance_id = $2 ORDER BY updated_at DESC", schema_q, table_q);
         errdefer allocator.free(self_.q_list_sid);
 
         // Run migrations
@@ -240,16 +243,20 @@ const PostgresMemoryImpl = struct {
         const ddl = try std.fmt.allocPrintZ(self.allocator,
             \\CREATE TABLE IF NOT EXISTS {s}.{s} (
             \\    id TEXT PRIMARY KEY,
-            \\    key TEXT NOT NULL UNIQUE,
+            \\    key TEXT NOT NULL,
             \\    content TEXT NOT NULL,
             \\    category TEXT NOT NULL DEFAULT 'core',
             \\    session_id TEXT,
+            \\    instance_id TEXT NOT NULL DEFAULT '',
             \\    created_at TEXT NOT NULL,
             \\    updated_at TEXT NOT NULL
             \\);
+            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT '';
+            \\DROP INDEX IF EXISTS {s}.idx_{s}_key;
+            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_{s}_key_instance ON {s}.{s}(key, instance_id);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_category ON {s}.{s}(category);
-            \\CREATE INDEX IF NOT EXISTS idx_{s}_key ON {s}.{s}(key);
             \\CREATE INDEX IF NOT EXISTS idx_{s}_session ON {s}.{s}(session_id);
+            \\CREATE INDEX IF NOT EXISTS idx_{s}_instance ON {s}.{s}(instance_id);
             \\CREATE TABLE IF NOT EXISTS {s}.messages (
             \\    id SERIAL PRIMARY KEY,
             \\    session_id TEXT NOT NULL,
@@ -259,9 +266,14 @@ const PostgresMemoryImpl = struct {
             \\);
         , .{
             self.schema_q, self.table_q,
-            raw_table,     self.schema_q, self.table_q,
-            raw_table,     self.schema_q, self.table_q,
-            raw_table,     self.schema_q, self.table_q,
+            self.schema_q, self.table_q,
+            self.schema_q, raw_table,
+            raw_table,     self.schema_q,
+            self.table_q,  raw_table,
+            self.schema_q, self.table_q,
+            raw_table,     self.schema_q,
+            self.table_q,  raw_table,
+            self.schema_q, self.table_q,
             self.schema_q,
         });
         defer self.allocator.free(ddl);
@@ -377,12 +389,16 @@ const PostgresMemoryImpl = struct {
         const sid_z: ?[*:0]u8 = if (session_id) |sid| try self_.allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |s| self_.allocator.free(std.mem.span(s));
 
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
+
         const params = [_]?[*:0]const u8{
             id_z,
             key_z,
             content_z,
             cat_z,
             sid_z,
+            iid_z,
             now_z,
             now_z,
         };
@@ -392,6 +408,7 @@ const PostgresMemoryImpl = struct {
             @intCast(content.len),
             @intCast(cat_str.len),
             if (session_id) |sid| @as(c_int, @intCast(sid.len)) else 0,
+            @intCast(self_.instance_id.len),
             @intCast(now.len),
             @intCast(now.len),
         };
@@ -413,16 +430,19 @@ const PostgresMemoryImpl = struct {
         var limit_buf: [20]u8 = undefined;
         const limit_str = try std.fmt.bufPrintZ(&limit_buf, "{d}", .{limit});
 
+        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        defer allocator.free(iid_z);
+
         var result: *c.PGresult = undefined;
         if (session_id) |sid| {
             const sid_z = try allocator.dupeZ(u8, sid);
             defer allocator.free(sid_z);
-            const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr, sid_z };
-            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(sid.len) };
+            const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr, sid_z, iid_z };
+            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(sid.len), @intCast(self_.instance_id.len) };
             result = try self_.execParams(self_.q_recall_sid, &params, &lengths);
         } else {
-            const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr };
-            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)) };
+            const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr, iid_z };
+            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(self_.instance_id.len) };
             result = try self_.execParams(self_.q_recall, &params, &lengths);
         }
         defer c.PQclear(result);
@@ -454,9 +474,11 @@ const PostgresMemoryImpl = struct {
 
         const key_z = try allocator.dupeZ(u8, key);
         defer allocator.free(key_z);
+        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        defer allocator.free(iid_z);
 
-        const params = [_]?[*:0]const u8{key_z};
-        const lengths = [_]c_int{@intCast(key.len)};
+        const params = [_]?[*:0]const u8{ key_z, iid_z };
+        const lengths = [_]c_int{ @intCast(key.len), @intCast(self_.instance_id.len) };
 
         const result = try self_.execParams(self_.q_get, &params, &lengths);
         defer c.PQclear(result);
@@ -468,6 +490,9 @@ const PostgresMemoryImpl = struct {
     fn implList(ptr: *anyopaque, allocator: std.mem.Allocator, category: ?MemoryCategory, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
+        const iid_z = try allocator.dupeZ(u8, self_.instance_id);
+        defer allocator.free(iid_z);
+
         var result: *c.PGresult = undefined;
         if (category) |cat| {
             const cat_str = cat.toString();
@@ -476,22 +501,24 @@ const PostgresMemoryImpl = struct {
             if (session_id) |sid| {
                 const sid_z = try allocator.dupeZ(u8, sid);
                 defer allocator.free(sid_z);
-                const params = [_]?[*:0]const u8{ cat_z, sid_z };
-                const lengths = [_]c_int{ @intCast(cat_str.len), @intCast(sid.len) };
+                const params = [_]?[*:0]const u8{ cat_z, sid_z, iid_z };
+                const lengths = [_]c_int{ @intCast(cat_str.len), @intCast(sid.len), @intCast(self_.instance_id.len) };
                 result = try self_.execParams(self_.q_list_cat_sid, &params, &lengths);
             } else {
-                const params = [_]?[*:0]const u8{cat_z};
-                const lengths = [_]c_int{@intCast(cat_str.len)};
+                const params = [_]?[*:0]const u8{ cat_z, iid_z };
+                const lengths = [_]c_int{ @intCast(cat_str.len), @intCast(self_.instance_id.len) };
                 result = try self_.execParams(self_.q_list_cat, &params, &lengths);
             }
         } else if (session_id) |sid| {
             const sid_z = try allocator.dupeZ(u8, sid);
             defer allocator.free(sid_z);
-            const params = [_]?[*:0]const u8{sid_z};
-            const lengths = [_]c_int{@intCast(sid.len)};
+            const params = [_]?[*:0]const u8{ sid_z, iid_z };
+            const lengths = [_]c_int{ @intCast(sid.len), @intCast(self_.instance_id.len) };
             result = try self_.execParams(self_.q_list_sid, &params, &lengths);
         } else {
-            result = try self_.execParams(self_.q_list_all, &.{}, &.{});
+            const params = [_]?[*:0]const u8{iid_z};
+            const lengths = [_]c_int{@intCast(self_.instance_id.len)};
+            result = try self_.execParams(self_.q_list_all, &params, &lengths);
         }
         defer c.PQclear(result);
 
@@ -516,9 +543,11 @@ const PostgresMemoryImpl = struct {
 
         const key_z = try self_.allocator.dupeZ(u8, key);
         defer self_.allocator.free(key_z);
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
 
-        const params = [_]?[*:0]const u8{key_z};
-        const lengths = [_]c_int{@intCast(key.len)};
+        const params = [_]?[*:0]const u8{ key_z, iid_z };
+        const lengths = [_]c_int{ @intCast(key.len), @intCast(self_.instance_id.len) };
 
         const result = try self_.execParams(self_.q_forget, &params, &lengths);
         defer c.PQclear(result);
@@ -532,7 +561,12 @@ const PostgresMemoryImpl = struct {
     fn implCount(ptr: *anyopaque) anyerror!usize {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
-        const result = try self_.execParams(self_.q_count, &.{}, &.{});
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
+        const params = [_]?[*:0]const u8{iid_z};
+        const lengths = [_]c_int{@intCast(self_.instance_id.len)};
+
+        const result = try self_.execParams(self_.q_count, &params, &lengths);
         defer c.PQclear(result);
 
         if (c.PQntuples(result) == 0) return 0;
@@ -648,15 +682,20 @@ const PostgresMemoryImpl = struct {
     fn implSessionClearAutoSaved(ptr: *anyopaque, session_id: ?[]const u8) anyerror!void {
         const self_: *Self = @ptrCast(@alignCast(ptr));
 
+        const iid_z = try self_.allocator.dupeZ(u8, self_.instance_id);
+        defer self_.allocator.free(iid_z);
+
         if (session_id) |sid| {
             const sid_z = try self_.allocator.dupeZ(u8, sid);
             defer self_.allocator.free(sid_z);
-            const params = [_]?[*:0]const u8{sid_z};
-            const lengths = [_]c_int{@intCast(sid.len)};
+            const params = [_]?[*:0]const u8{ sid_z, iid_z };
+            const lengths = [_]c_int{ @intCast(sid.len), @intCast(self_.instance_id.len) };
             const result = try self_.execParams(self_.q_clear_auto_sid, &params, &lengths);
             c.PQclear(result);
         } else {
-            const result = try self_.execParams(self_.q_clear_auto, &.{}, &.{});
+            const params = [_]?[*:0]const u8{iid_z};
+            const lengths = [_]c_int{@intCast(self_.instance_id.len)};
+            const result = try self_.execParams(self_.q_clear_auto, &params, &lengths);
             c.PQclear(result);
         }
     }

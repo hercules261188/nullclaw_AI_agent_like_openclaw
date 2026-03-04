@@ -266,7 +266,7 @@ pub fn run(allocator: std.mem.Allocator, args: []const []const u8) !void {
     };
 
     // Scaffold workspace files
-    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{});
+    try onboard.scaffoldWorkspace(allocator, cfg.workspace_dir, &onboard.ProjectContext{}, null);
 
     // Save config
     try cfg.save();

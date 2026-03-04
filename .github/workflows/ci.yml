@@ -52,6 +52,14 @@ jobs:
         if: runner.os == 'Linux'
         run: zig build -Dtarget=aarch64-linux-musl -Doptimize=ReleaseSmall
 
+      - name: Cross-compile linux-arm32 (glibc)
+        if: runner.os == 'Linux'
+        run: zig build -Dtarget=arm-linux-gnueabihf -Doptimize=ReleaseSmall
+
+      - name: Cross-compile linux-arm32 (musl)
+        if: runner.os == 'Linux'
+        run: zig build -Dtarget=arm-linux-musleabihf -Doptimize=ReleaseSmall
+
       - name: Job summary
         if: always()
         run: |

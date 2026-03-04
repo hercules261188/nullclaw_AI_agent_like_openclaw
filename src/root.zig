@@ -41,6 +41,7 @@ pub const agent = @import("agent.zig");
 pub const session = @import("session.zig");
 pub const providers = @import("providers/root.zig");
 pub const memory = @import("memory/root.zig");
+pub const bootstrap = @import("bootstrap/root.zig");
 
 // Phase 3: Networking
 pub const gateway = @import("gateway.zig");

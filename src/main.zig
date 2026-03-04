@@ -711,6 +711,11 @@ fn printWorkspaceUsage() void {
         \\Usage: nullclaw workspace <command> [args]
         \\
         \\Commands:
+        \\  edit <filename>
+        \\      Open a bootstrap file (SOUL.md, AGENTS.md, etc.) in $EDITOR.
+        \\      For file-based backends (markdown, hybrid) edits the file directly.
+        \\      For DB-backed backends, use the agent's memory_store tool instead.
+        \\
         \\  reset-md [--dry-run] [--include-bootstrap] [--clear-memory-md]
         \\      Reset prompt markdown files (AGENTS/SOUL/TOOLS/IDENTITY/USER/HEARTBEAT)
         \\      to bundled defaults.
@@ -993,6 +998,11 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
     defer cfg.deinit();
 
     const subcmd = sub_args[0];
+    if (std.mem.eql(u8, subcmd, "edit")) {
+        runWorkspaceEdit(allocator, sub_args[1..], cfg);
+        return;
+    }
+
     if (!std.mem.eql(u8, subcmd, "reset-md")) {
         std.debug.print("Unknown workspace command: {s}\n\n", .{subcmd});
         printWorkspaceUsage();
@@ -1028,6 +1038,7 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
             .clear_memory_markdown = clear_memory_md,
             .dry_run = dry_run,
         },
+        null,
     );
 
     if (dry_run) {
@@ -1041,6 +1052,63 @@ fn runWorkspace(allocator: std.mem.Allocator, sub_args: []const []const u8) !voi
             .{ report.rewritten_files, report.removed_files },
         );
     }
+}
+
+fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg: yc.config.Config) void {
+    if (args.len < 1) {
+        std.debug.print("Usage: nullclaw workspace edit <filename>\n\n", .{});
+        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
+        std.process.exit(1);
+    }
+    const filename = args[0];
+
+    if (!yc.bootstrap.isBootstrapFilename(filename)) {
+        std.debug.print("Not a bootstrap file: {s}\n", .{filename});
+        std.debug.print("Bootstrap files: SOUL.md, AGENTS.md, TOOLS.md, IDENTITY.md, USER.md, HEARTBEAT.md, BOOTSTRAP.md, MEMORY.md\n", .{});
+        std.process.exit(1);
+    }
+
+    // Only file-based backends (markdown, hybrid) support direct editing.
+    if (!yc.memory.usesWorkspaceBootstrapFiles(cfg.memory.backend)) {
+        std.debug.print(
+            "The '{s}' backend stores bootstrap files in the database.\n" ++
+                "Edit bootstrap files through the agent using the memory_store tool,\n" ++
+                "or switch to the hybrid backend for file-based editing.\n",
+            .{cfg.memory.backend},
+        );
+        std.process.exit(1);
+    }
+
+    const filepath = std.fmt.allocPrint(allocator, "{s}/{s}", .{ cfg.workspace_dir, filename }) catch {
+        std.debug.print("Failed to build file path\n", .{});
+        std.process.exit(1);
+    };
+    defer allocator.free(filepath);
+
+    // Determine editor: $VISUAL, $EDITOR, fallback to vi
+    var editor_owned = getEnvVarOwnedOrNull(allocator, "VISUAL");
+    if (editor_owned == null) {
+        editor_owned = getEnvVarOwnedOrNull(allocator, "EDITOR");
+    }
+    defer if (editor_owned) |value| allocator.free(value);
+    const editor = if (editor_owned) |value| value else "vi";
+
+    var child = std.process.Child.init(&.{ editor, filepath }, allocator);
+    child.stdin_behavior = .Inherit;
+    child.stdout_behavior = .Inherit;
+    child.stderr_behavior = .Inherit;
+
+    _ = child.spawnAndWait() catch |err| {
+        std.debug.print("Failed to launch editor '{s}': {s}\n", .{ editor, @errorName(err) });
+        std.process.exit(1);
+    };
+}
+
+fn getEnvVarOwnedOrNull(allocator: std.mem.Allocator, name: []const u8) ?[]u8 {
+    return std.process.getEnvVarOwned(allocator, name) catch |err| switch (err) {
+        error.EnvironmentVariableNotFound => null,
+        else => null,
+    };
 }
 
 fn runCapabilities(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
@@ -1680,6 +1748,19 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 
+    // Create optional memory backend (don't fail if unavailable).
+    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    const bootstrap_provider: ?yc.bootstrap.BootstrapProvider = yc.bootstrap.createProvider(
+        allocator,
+        config.memory.backend,
+        mem_opt,
+        config.workspace_dir,
+    ) catch null;
+    defer if (bootstrap_provider) |bp| bp.deinit();
+
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
@@ -1698,17 +1779,14 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
         .subagent_manager = &subagent_manager,
+        .bootstrap_provider = bootstrap_provider,
+        .backend_name = config.memory.backend,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});
     }
-
-    // Create optional memory backend (don't fail if unavailable)
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
 
     // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
     if (mem_rt) |*rt| {
@@ -1990,6 +2068,19 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     subagent_manager.task_runner = yc.subagent_runner.runTaskWithTools;
     defer subagent_manager.deinit();
 
+    // Create optional memory backend (don't fail if unavailable).
+    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
+    defer if (mem_rt) |*rt| rt.deinit();
+    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
+
+    const bootstrap_provider: ?yc.bootstrap.BootstrapProvider = yc.bootstrap.createProvider(
+        allocator,
+        config.memory.backend,
+        mem_opt,
+        config.workspace_dir,
+    ) catch null;
+    defer if (bootstrap_provider) |bp| bp.deinit();
+
     // Create tools (for system prompt and tool calling)
     const tools = yc.tools.allTools(allocator, config.workspace_dir, .{
         .http_enabled = config.http_request.enabled,
@@ -2008,17 +2099,14 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .allowed_paths = config.autonomy.allowed_paths,
         .policy = &sec_policy,
         .subagent_manager = &subagent_manager,
+        .bootstrap_provider = bootstrap_provider,
+        .backend_name = config.memory.backend,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
 
     if (mcp_tools) |mt| {
         std.debug.print("  MCP tools: {d}\n", .{mt.len});
     }
-
-    // Create optional memory backend (don't fail if unavailable)
-    var mem_rt = yc.memory.initRuntime(allocator, &config.memory, config.workspace_dir);
-    defer if (mem_rt) |*rt| rt.deinit();
-    const mem_opt: ?yc.memory.Memory = if (mem_rt) |rt| rt.memory else null;
 
     // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
     if (mem_rt) |*rt| {

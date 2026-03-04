@@ -42,6 +42,7 @@ pub const BackendConfig = struct {
     postgres_connect_timeout_secs: u32 = 30,
     redis_config: ?config_types.MemoryRedisConfig = null,
     api_config: ?config_types.MemoryApiConfig = null,
+    instance_id: []const u8 = "",
 };
 
 pub const BackendInstance = struct {
@@ -131,6 +132,23 @@ const none_backend = BackendDescriptor{
     .create = &createNone,
 };
 
+const hybrid_backends = if (build_options.enable_memory_sqlite) [_]BackendDescriptor{
+    .{
+        .name = "hybrid",
+        .label = "Hybrid: SQLite + Markdown",
+        .auto_save_default = true,
+        .capabilities = .{
+            .supports_keyword_rank = true,
+            .supports_session_store = true,
+            .supports_transactions = true,
+            .supports_outbox = true,
+        },
+        .needs_db_path = true,
+        .needs_workspace = true,
+        .create = &createHybrid,
+    },
+} else [0]BackendDescriptor{};
+
 const markdown_backends = if (build_options.enable_memory_markdown) [_]BackendDescriptor{
     markdown_backend,
 } else [0]BackendDescriptor{};
@@ -173,8 +191,9 @@ const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
     .create = &createPostgres,
 }} else [0]BackendDescriptor{};
 
-pub const all = markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends;
+pub const all = hybrid_backends ++ markdown_backends ++ api_backends ++ memory_backends ++ none_backends ++ sqlite_backends ++ lucid_backends ++ redis_backends ++ lancedb_backends ++ pg_backends;
 pub const known_backend_names = [_][]const u8{
+    "hybrid",
     "none",
     "markdown",
     "memory",
@@ -185,7 +204,7 @@ pub const known_backend_names = [_][]const u8{
     "lancedb",
     "postgres",
 };
-pub const known_backends_csv = "none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres";
+pub const known_backends_csv = "hybrid, none, markdown, memory, api, sqlite, lucid, redis, lancedb, postgres";
 
 // ── Lookup ───────────────────────────────────────────────────────
 
@@ -204,6 +223,7 @@ pub fn isKnownBackend(name: []const u8) bool {
 }
 
 pub fn engineTokenForBackend(name: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, name, "hybrid")) return "sqlite";
     if (std.mem.eql(u8, name, "none")) return "none";
     if (std.mem.eql(u8, name, "markdown")) return "markdown";
     if (std.mem.eql(u8, name, "memory")) return "memory";
@@ -274,6 +294,10 @@ pub fn resolvePaths(
 
 // ── Factory wrappers ─────────────────────────────────────────────
 
+fn createHybrid(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
+    return createSqlite(allocator, cfg);
+}
+
 fn createSqlite(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     const impl_ = try allocator.create(root.SqliteMemory);
     errdefer allocator.destroy(impl_);
@@ -316,6 +340,7 @@ fn createRedis(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstanc
         .db_index = rcfg.db_index,
         .key_prefix = rcfg.key_prefix,
         .ttl_seconds = if (rcfg.ttl_seconds > 0) rcfg.ttl_seconds else null,
+        .instance_id = cfg.instance_id,
     });
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = null };
@@ -358,7 +383,7 @@ fn createPostgres(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInst
 
     const impl_ = try allocator.create(pg.PostgresMemory);
     errdefer allocator.destroy(impl_);
-    impl_.* = try pg.PostgresMemory.init(allocator, effective_url.ptr, cfg.postgres_schema, cfg.postgres_table);
+    impl_.* = try pg.PostgresMemory.init(allocator, effective_url.ptr, cfg.postgres_schema, cfg.postgres_table, cfg.instance_id);
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = impl_.sessionStore() };
 }
@@ -390,6 +415,7 @@ fn applyPostgresConnectTimeout(
 
 test "registry length" {
     const expected: usize =
+        @as(usize, @intFromBool(build_options.enable_memory_sqlite)) + // hybrid
         @as(usize, @intFromBool(build_options.enable_memory_markdown)) +
         @as(usize, @intFromBool(build_options.enable_memory_api)) +
         @as(usize, @intFromBool(build_options.enable_memory_memory)) +

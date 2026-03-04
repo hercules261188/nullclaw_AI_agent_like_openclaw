@@ -96,6 +96,10 @@ pub const SecurityPolicy = struct {
             const lower_base = lowerBuf(base);
             const joined_lower = lowerBuf(cmd_part);
 
+            // One explicit escape hatch for onboarding lifecycle:
+            // deleting only BOOTSTRAP.md via rm/trash is considered low risk.
+            if (isSafeBootstrapDeleteCommandSegment(cmd_part)) continue;
+
             // High-risk commands
             if (isHighRiskCommand(lower_base.slice())) return .high;
 
@@ -206,6 +210,12 @@ pub const SecurityPolicy = struct {
             if (base_cmd.len == 0) continue;
 
             has_cmd = true;
+
+            // Allow only the narrow onboarding lifecycle delete command:
+            // rm/trash BOOTSTRAP.md (single safe target only).
+            if (isSafeBootstrapDeleteCommandSegment(cmd_part)) {
+                continue;
+            }
 
             var found = false;
             for (self.allowed_commands) |raw_allowed| {
@@ -426,6 +436,69 @@ fn isArgsSafe(base_cmd: []const u8, full_cmd: []const u8) bool {
     return true;
 }
 
+fn trimMatchingQuotes(s: []const u8) []const u8 {
+    if (s.len >= 2) {
+        if ((s[0] == '\'' and s[s.len - 1] == '\'') or
+            (s[0] == '"' and s[s.len - 1] == '"'))
+        {
+            return s[1 .. s.len - 1];
+        }
+    }
+    return s;
+}
+
+fn isSafeBootstrapDeleteTarget(raw_arg: []const u8) bool {
+    const trimmed = trimMatchingQuotes(std.mem.trim(u8, raw_arg, " \t"));
+    if (trimmed.len == 0) return false;
+
+    // No absolute paths, traversal, or globs.
+    if (std.fs.path.isAbsolute(trimmed)) return false;
+    if (containsStr(trimmed, "..")) return false;
+    if (containsStr(trimmed, "*") or containsStr(trimmed, "?") or
+        containsStr(trimmed, "[") or containsStr(trimmed, "]"))
+    {
+        return false;
+    }
+
+    if (std.ascii.eqlIgnoreCase(trimmed, "BOOTSTRAP.md")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, "./BOOTSTRAP.md")) return true;
+    if (std.ascii.eqlIgnoreCase(trimmed, ".\\BOOTSTRAP.md")) return true;
+    return false;
+}
+
+fn isSafeBootstrapDeleteCommandSegment(cmd_part: []const u8) bool {
+    const trimmed = std.mem.trim(u8, cmd_part, " \t");
+    if (trimmed.len == 0) return false;
+
+    var words = std.mem.tokenizeAny(u8, trimmed, " \t");
+    const first = words.next() orelse return false;
+    const base = lowerBuf(extractBasename(first)).slice();
+    const is_delete_tool = std.mem.eql(u8, base, "rm") or
+        std.mem.eql(u8, base, "trash") or
+        std.mem.eql(u8, base, "trash-put") or
+        std.mem.eql(u8, base, "del");
+    if (!is_delete_tool) return false;
+
+    var saw_target = false;
+    var options_done = false;
+    while (words.next()) |raw_arg| {
+        const arg = std.mem.trim(u8, raw_arg, " \t");
+        if (arg.len == 0) continue;
+
+        if (!options_done and std.mem.eql(u8, arg, "--")) {
+            options_done = true;
+            continue;
+        }
+        if (!options_done and arg[0] == '-') continue;
+        if (!options_done and std.mem.eql(u8, base, "del") and arg[0] == '/') continue;
+
+        if (!isSafeBootstrapDeleteTarget(arg)) return false;
+        saw_target = true;
+    }
+
+    return saw_target;
+}
+
 /// Allowlist entry formats:
 /// - "*" → any base command
 /// - "cmd" → exact base command
@@ -516,6 +589,26 @@ test "allowed commands basic" {
     try std.testing.expect(p.isCommandAllowed("cargo build --release"));
     try std.testing.expect(p.isCommandAllowed("cat file.txt"));
     try std.testing.expect(p.isCommandAllowed("grep -r pattern ."));
+}
+
+test "bootstrap delete command is allowed" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(p.isCommandAllowed("rm BOOTSTRAP.md"));
+    try std.testing.expect(p.isCommandAllowed("rm -f -- ./BOOTSTRAP.md"));
+    try std.testing.expect(p.isCommandAllowed("trash BOOTSTRAP.md"));
+}
+
+test "bootstrap delete command remains narrow and safe" {
+    const p = SecurityPolicy{};
+    try std.testing.expect(!p.isCommandAllowed("rm BOOTSTRAP.md README.md"));
+    try std.testing.expect(!p.isCommandAllowed("rm ../BOOTSTRAP.md"));
+    try std.testing.expect(!p.isCommandAllowed("rm /tmp/BOOTSTRAP.md"));
+}
+
+test "bootstrap delete command risk and validation" {
+    const p = SecurityPolicy{};
+    try std.testing.expectEqual(CommandRiskLevel.low, p.commandRiskLevel("rm BOOTSTRAP.md"));
+    try std.testing.expectEqual(CommandRiskLevel.low, try p.validateCommandExecution("rm BOOTSTRAP.md", false));
 }
 
 test "blocked commands basic" {

@@ -291,7 +291,7 @@ pub fn run() !void {
 test "export_manifest produces valid structure" {
     // Verify the data sources are accessible and have expected counts
     try std.testing.expect(onboard.known_providers.len >= 29);
-    try std.testing.expect(onboard.wizard_memory_backend_order.len == 9);
+    try std.testing.expect(onboard.wizard_memory_backend_order.len == 10);
     try std.testing.expect(onboard.tunnel_options.len == 4);
     try std.testing.expect(onboard.autonomy_options.len == 3);
     try std.testing.expect(channel_catalog.known_channels.len >= 20);
@@ -299,6 +299,6 @@ test "export_manifest produces valid structure" {
     // Verify first provider
     try std.testing.expectEqualStrings("openrouter", onboard.known_providers[0].key);
 
-    // Verify memory backends start with sqlite
-    try std.testing.expectEqualStrings("sqlite", onboard.wizard_memory_backend_order[0]);
+    // Verify memory backends start with hybrid
+    try std.testing.expectEqualStrings("hybrid", onboard.wizard_memory_backend_order[0]);
 }

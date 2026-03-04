@@ -10,6 +10,8 @@ const providers = @import("../providers/root.zig");
 const config_types = @import("../config_types.zig");
 const Provider = providers.Provider;
 const ChatMessage = providers.ChatMessage;
+const bootstrap_mod = @import("../bootstrap/root.zig");
+const BootstrapProvider = bootstrap_mod.BootstrapProvider;
 
 const Agent = @import("root.zig").Agent;
 const OwnedMessage = Agent.OwnedMessage;
@@ -51,6 +53,7 @@ pub const CompactionConfig = struct {
     token_limit: u64 = DEFAULT_TOKEN_LIMIT,
     max_history_messages: u32 = 50,
     workspace_dir: ?[]const u8 = null,
+    bootstrap_provider: ?BootstrapProvider = null,
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -127,7 +130,7 @@ pub fn autoCompactHistory(
     } else try summarizeSlice(allocator, provider, model_name, history.items, start, compact_end, config);
     defer allocator.free(summary);
 
-    const workspace_context = try readWorkspaceContextForSummary(allocator, config.workspace_dir);
+    const workspace_context = try readWorkspaceContextForSummary(allocator, config.workspace_dir, config.bootstrap_provider);
     defer allocator.free(workspace_context);
 
     const summary_with_context = if (workspace_context.len > 0)
@@ -485,7 +488,33 @@ fn openWorkspaceAgentsFileGuarded(
 fn readWorkspaceContextForSummary(
     allocator: std.mem.Allocator,
     workspace_dir: ?[]const u8,
+    bootstrap_provider: ?BootstrapProvider,
 ) ![]u8 {
+    // Try bootstrap provider first when available.
+    if (bootstrap_provider) |bp| {
+        const bp_content = bp.load(allocator, "AGENTS.md") catch null;
+        if (bp_content) |content| {
+            defer allocator.free(content);
+            const sections = try extractSections(allocator, content, &.{ "Session Startup", "Red Lines" });
+            defer allocator.free(sections);
+            if (sections.len == 0) return try allocator.dupe(u8, "");
+
+            const safe_content = if (sections.len > MAX_WORKSPACE_CONTEXT_CHARS)
+                try std.fmt.allocPrint(allocator, "{s}\n...[truncated]...", .{sections[0..MAX_WORKSPACE_CONTEXT_CHARS]})
+            else
+                try allocator.dupe(u8, sections);
+            defer allocator.free(safe_content);
+
+            return try std.fmt.allocPrint(
+                allocator,
+                "\n\n<workspace-critical-rules>\n{s}\n</workspace-critical-rules>",
+                .{safe_content},
+            );
+        }
+        return try allocator.dupe(u8, "");
+    }
+
+    // Fallback: direct file read.
     const dir = workspace_dir orelse return try allocator.dupe(u8, "");
     const file = openWorkspaceAgentsFileGuarded(allocator, dir) orelse return try allocator.dupe(u8, "");
     defer file.close();
@@ -738,7 +767,7 @@ test "readWorkspaceContextForSummary wraps AGENTS critical sections" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace);
+    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
     defer std.testing.allocator.free(context);
 
     try std.testing.expect(std.mem.indexOf(u8, context, "<workspace-critical-rules>") != null);
@@ -753,7 +782,7 @@ test "readWorkspaceContextForSummary returns empty when AGENTS missing" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace);
+    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
     defer std.testing.allocator.free(context);
 
     try std.testing.expectEqual(@as(usize, 0), context.len);
@@ -788,7 +817,7 @@ test "readWorkspaceContextForSummary blocks AGENTS symlink escape" {
     const workspace = try ws_tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace);
+    const context = try readWorkspaceContextForSummary(std.testing.allocator, workspace, null);
     defer std.testing.allocator.free(context);
 
     try std.testing.expectEqual(@as(usize, 0), context.len);
