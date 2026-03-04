@@ -21,6 +21,18 @@ The smallest fully autonomous AI assistant infrastructure — a static Zig binar
 678 KB binary · <2 ms startup · 3,230+ tests · 22+ providers · 18 channels · Pluggable everything
 ```
 
+## 中文文档
+
+- [中文文档总览](docs/zh/README.md)
+- [安装指南](docs/zh/installation.md)
+- [配置指南](docs/zh/configuration.md)
+- [使用与运维](docs/zh/usage.md)
+- [架构总览](docs/zh/architecture.md)
+- [安全机制](docs/zh/security.md)
+- [Gateway API](docs/zh/gateway-api.md)
+- [命令参考](docs/zh/commands.md)
+- [开发指南](docs/zh/development.md)
+
 ### Features
 
 - **Impossibly Small:** 678 KB static binary — no runtime, no VM, no framework overhead.
