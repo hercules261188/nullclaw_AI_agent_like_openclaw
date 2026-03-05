@@ -54,6 +54,11 @@ pub const WebFetchTool = struct {
         // resolve once, validate global address, and connect directly to it.
         const host = net_security.extractHost(url) orelse
             return ToolResult.fail("Invalid URL: cannot extract host");
+        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
+            error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
+            else => return ToolResult.fail("Unable to verify host safety"),
+        };
+        defer allocator.free(connect_host);
 
         // Keep security surface aligned with http_request.
         if (self.allowed_domains.len > 0) {
@@ -61,12 +66,6 @@ pub const WebFetchTool = struct {
                 return ToolResult.fail("Host is not in http_request.allowed_domains");
             }
         }
-
-        const connect_host = net_security.resolveConnectHost(allocator, host, resolved_port) catch |err| switch (err) {
-            error.LocalAddressBlocked => return ToolResult.fail("Blocked local/private host"),
-            else => return ToolResult.fail("Unable to verify host safety"),
-        };
-        defer allocator.free(connect_host);
 
         const max_chars = parseMaxCharsWithDefault(args, self.default_max_chars);
 
@@ -495,6 +494,16 @@ test "WebFetchTool blocked when host is not in allowlist" {
     const result = try wft.execute(testing.allocator, parsed.value.object);
     try testing.expect(!result.success);
     try testing.expectEqualStrings("Host is not in http_request.allowed_domains", result.error_msg.?);
+}
+
+test "WebFetchTool local host remains blocked with allowlist configured" {
+    const domains = [_][]const u8{"example.com"};
+    var wft = WebFetchTool{ .allowed_domains = &domains };
+    const parsed = try root.parseTestArgs("{\"url\":\"http://127.0.0.1/\"}");
+    defer parsed.deinit();
+    const result = try wft.execute(testing.allocator, parsed.value.object);
+    try testing.expect(!result.success);
+    try testing.expectEqualStrings("Blocked local/private host", result.error_msg.?);
 }
 
 test "buildCurlResolveEntry formats ipv4 connect target" {
