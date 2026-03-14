@@ -204,7 +204,11 @@ pub fn main() !void {
     switch (cmd) {
         .version => printVersion(),
         .status => try yc.status.run(allocator),
-        .agent => try yc.agent.run(allocator, sub_args),
+        .agent => if (hasHelpFlag(sub_args)) {
+            printAgentUsage();
+        } else {
+            try yc.agent.run(allocator, sub_args);
+        },
         .onboard => try runOnboard(allocator, sub_args),
         .doctor => try yc.doctor.run(allocator),
         .help => printUsage(),
@@ -254,6 +258,15 @@ fn hasVerboseFlag(args: []const []const u8) bool {
     return false;
 }
 
+fn hasHelpFlag(args: []const []const u8) bool {
+    for (args) |arg| {
+        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
+            return true;
+        }
+    }
+    return false;
+}
+
 fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const u8) GatewayDaemonOverrideError!void {
     var port: u16 = cfg.gateway.port;
     var host: []const u8 = cfg.gateway.host;
@@ -275,7 +288,45 @@ fn applyGatewayDaemonOverrides(cfg: *yc.config.Config, sub_args: []const []const
 
 // ── Gateway ──────────────────────────────────────────────────────
 
+fn printGatewayUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw gateway [options]
+        \\
+        \\Start the gateway server (HTTP/WebSocket).
+        \\
+        \\OPTIONS:
+        \\  --port PORT, -p PORT   Override gateway listen port
+        \\  --host HOST            Override gateway listen host
+        \\  --verbose, -v          Enable verbose logging
+        \\  --help, -h             Show this help
+        \\
+    , .{});
+}
+
+fn printAgentUsage() void {
+    std.debug.print(
+        \\Usage: nullclaw agent [options]
+        \\
+        \\Start the AI agent loop.
+        \\
+        \\OPTIONS:
+        \\  -m, --message MESSAGE        Run a single message (non-interactive)
+        \\  -s, --session SESSION         Resume a specific session
+        \\  --provider PROVIDER           Override default provider
+        \\  --model MODEL                 Override default model
+        \\  --temperature TEMP            Override sampling temperature
+        \\  --verbose, -v                 Enable verbose logging
+        \\  --help, -h                    Show this help
+        \\
+    , .{});
+}
+
 fn runGateway(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
+    if (hasHelpFlag(sub_args)) {
+        printGatewayUsage();
+        return;
+    }
+
     var cfg = yc.config.Config.load(allocator) catch {
         std.debug.print("No config found -- run `nullclaw onboard` first\n", .{});
         std.process.exit(1);
