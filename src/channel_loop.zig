@@ -15,7 +15,6 @@ const memory_mod = @import("memory/root.zig");
 const bootstrap_mod = @import("bootstrap/root.zig");
 const observability = @import("observability.zig");
 const tools_mod = @import("tools/root.zig");
-const mcp = @import("mcp.zig");
 const voice = @import("voice.zig");
 const health = @import("health.zig");
 const daemon = @import("daemon.zig");
@@ -1041,16 +1040,6 @@ pub const ChannelRuntime = struct {
         const provider_i = runtime_provider.provider();
         const resolved_key = runtime_provider.primaryApiKey();
 
-        // MCP tools
-        const mcp_tools: ?[]const tools_mod.Tool = if (config.mcp_servers.len > 0)
-            mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-                log.warn("MCP init failed: {}", .{err});
-                break :blk null;
-            }
-        else
-            null;
-        defer if (mcp_tools) |mt| allocator.free(mt);
-
         const subagent_manager = allocator.create(subagent_mod.SubagentManager) catch null;
         errdefer if (subagent_manager) |mgr| allocator.destroy(mgr);
         if (subagent_manager) |mgr| {
@@ -1105,7 +1094,7 @@ pub const ChannelRuntime = struct {
             .web_search_fallback_providers = config.http_request.search_fallback_providers,
             .browser_enabled = config.browser.enabled,
             .screenshot_enabled = true,
-            .mcp_tools = mcp_tools,
+            .mcp_server_configs = config.mcp_servers,
             .agents = config.agents,
             .configured_providers = config.providers,
             .fallback_api_key = resolved_key,

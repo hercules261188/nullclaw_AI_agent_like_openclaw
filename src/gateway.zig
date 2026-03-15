@@ -3518,6 +3518,7 @@ pub fn run(allocator: std.mem.Allocator, host: []const u8, port: u16, config_ptr
                     .web_search_fallback_providers = cfg.http_request.search_fallback_providers,
                     .browser_enabled = cfg.browser.enabled,
                     .screenshot_enabled = true,
+                    .mcp_server_configs = cfg.mcp_servers,
                     .agents = cfg.agents,
                     .configured_providers = cfg.providers,
                     .fallback_api_key = resolved_api_key,

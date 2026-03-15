@@ -2569,16 +2569,6 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
 
     std.debug.print("  Polling for messages... (Ctrl+C to stop)\n\n", .{});
 
-    // Initialize MCP tools from config
-    const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
-        yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-            std.debug.print("  MCP: init failed: {}\n", .{err});
-            break :blk null;
-        }
-    else
-        null;
-    defer if (mcp_tools) |mt| allocator.free(mt);
-
     // Build security policy from config
     const security = @import("nullclaw").security.policy;
     var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
@@ -2624,7 +2614,7 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .web_search_fallback_providers = config.http_request.search_fallback_providers,
         .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
+        .mcp_server_configs = config.mcp_servers,
         .agents = config.agents,
         .configured_providers = config.providers,
         .fallback_api_key = resolved_api_key,
@@ -2636,10 +2626,6 @@ fn runSignalChannel(allocator: std.mem.Allocator, args: []const []const u8, conf
         .backend_name = config.memory.backend,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
-
-    if (mcp_tools) |mt| {
-        std.debug.print("  MCP tools: {d}\n", .{mt.len});
-    }
 
     // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
     if (mem_rt) |*rt| {
@@ -3106,16 +3092,6 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
     defer if (whisper_ptr) |wt| allocator.destroy(wt);
     if (whisper_ptr) |wt| tg.transcriber = wt.transcriber();
 
-    // Initialize MCP tools from config
-    const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
-        yc.mcp.initMcpTools(allocator, config.mcp_servers) catch |err| blk: {
-            std.debug.print("  MCP: init failed: {}\n", .{err});
-            break :blk null;
-        }
-    else
-        null;
-    defer if (mcp_tools) |mt| allocator.free(mt);
-
     // Build security policy from config
     const security = @import("nullclaw").security.policy;
     var tracker = security.RateTracker.init(allocator, config.autonomy.max_actions_per_hour);
@@ -3161,7 +3137,7 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .web_search_fallback_providers = config.http_request.search_fallback_providers,
         .browser_enabled = config.browser.enabled,
         .screenshot_enabled = true,
-        .mcp_tools = mcp_tools,
+        .mcp_server_configs = config.mcp_servers,
         .agents = config.agents,
         .configured_providers = config.providers,
         .fallback_api_key = resolved_api_key,
@@ -3173,10 +3149,6 @@ fn runTelegramChannel(allocator: std.mem.Allocator, args: []const []const u8, co
         .backend_name = config.memory.backend,
     }) catch &.{};
     defer if (tools.len > 0) yc.tools.deinitTools(allocator, tools);
-
-    if (mcp_tools) |mt| {
-        std.debug.print("  MCP tools: {d}\n", .{mt.len});
-    }
 
     // Wire MemoryRuntime into tools for retrieval pipeline + vector sync
     if (mem_rt) |*rt| {
