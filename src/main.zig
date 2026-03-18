@@ -39,7 +39,7 @@ const Command = enum {
 };
 
 const SERVICE_SUBCOMMANDS = "install|start|stop|restart|status|uninstall";
-const CRON_SUBCOMMANDS = "list|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
+const CRON_SUBCOMMANDS = "list|status|add|add-agent|once|once-agent|remove|pause|resume|run|update|runs";
 const CHANNEL_SUBCOMMANDS = "list|start|status|add|remove";
 const SKILLS_SUBCOMMANDS = "list|install|remove|info";
 const HARDWARE_SUBCOMMANDS = "scan|flash|monitor";
@@ -466,6 +466,7 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             \\
             \\Commands:
             \\  list                          List all scheduled tasks
+            \\  status                        Show scheduler daemon status
             \\  add <expression> <command>    Add a recurring cron job
             \\  add-agent <expression> <prompt> [--model <model>] [--announce] [--channel <name>] [--to <id>]
             \\                                Add a recurring agent cron job
@@ -487,6 +488,8 @@ fn runCron(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
 
     if (std.mem.eql(u8, subcmd, "list")) {
         try yc.cron.cliListJobs(allocator);
+    } else if (std.mem.eql(u8, subcmd, "status")) {
+        try yc.cron.cliStatus(allocator);
     } else if (std.mem.eql(u8, subcmd, "add")) {
         if (sub_args.len < 3) {
             std.debug.print("Usage: nullclaw cron add <expression> <command>\n", .{});
