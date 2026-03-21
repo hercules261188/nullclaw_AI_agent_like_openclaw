@@ -102,6 +102,7 @@ pub const CronJobPatch = struct {
     enabled: ?bool = null,
     model: ?[]const u8 = null,
     delete_after_run: ?bool = null,
+    session_target: ?SessionTarget = null,
 };
 
 /// A scheduled cron job.
@@ -652,6 +653,9 @@ pub const CronScheduler = struct {
             job.delete_after_run = d;
             job.one_shot = d;
         }
+        if (patch.session_target) |st| {
+            job.session_target = st;
+        }
         return true;
     }
 
@@ -829,7 +833,11 @@ pub const CronScheduler = struct {
                         job.last_output = self.allocator.dupe(u8, agent_output) catch null;
 
                         if (out_bus) |b| {
-                            _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                            if (job.session_target == .main) {
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, agent_output, true, b, job.name orelse job.id) catch {};
+                            } else {
+                                _ = deliverResult(self.allocator, job.delivery, agent_output, true, b) catch {};
+                            }
                         }
                     } else {
                         const exec_result = runAgentJob(self.allocator, self.shell_cwd, agent_output, job.model, self.agent_timeout_secs) catch |err| {
@@ -848,7 +856,11 @@ pub const CronScheduler = struct {
                         job.last_status = if (exec_result.success) "ok" else "error";
                         if (job.last_output) |old| self.allocator.free(old);
                         if (out_bus) |b| {
-                            _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
+                            if (job.session_target == .main) {
+                                _ = deliverViaMainAgent(self.allocator, job.delivery, exec_result.output, exec_result.success, b, job.name orelse job.id) catch {};
+                            } else {
+                                _ = deliverResult(self.allocator, job.delivery, exec_result.output, exec_result.success, b) catch {};
+                            }
                         }
 
                         job.last_output = if (exec_result.output.len > 0) exec_result.output else blk: {
@@ -1297,6 +1309,12 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             }
             break :blk null;
         };
+        const session_target = blk: {
+            if (obj.get("session_target")) |v| {
+                if (v == .string) break :blk SessionTarget.parse(v.string);
+            }
+            break :blk SessionTarget.isolated;
+        };
 
         try scheduler.jobs.append(scheduler.allocator, .{
             .id = try scheduler.allocator.dupe(u8, id),
@@ -1308,6 +1326,7 @@ fn loadJobsWithPolicy(scheduler: *CronScheduler, policy: LoadPolicy) !void {
             .paused = paused,
             .one_shot = one_shot,
             .job_type = job_type,
+            .session_target = session_target,
             .prompt = if (prompt) |p| try scheduler.allocator.dupe(u8, p) else null,
             .model = if (model) |m| try scheduler.allocator.dupe(u8, m) else null,
             .enabled = enabled,
@@ -1360,6 +1379,52 @@ pub fn deliverResult(
         try bus.makeOutbound(allocator, channel, chat_id, output);
     out_bus.publishOutbound(msg) catch |err| {
         // If best_effort, swallow the error after cleaning up
+        if (delivery.best_effort) {
+            msg.deinit(allocator);
+            return false;
+        }
+        msg.deinit(allocator);
+        return err;
+    };
+    return true;
+}
+
+/// Route a cron agent result through the main agent session via the inbound bus.
+/// The main agent receives the output as a system message, processes it with its
+/// full context (soul, memory, skills), and delivers a contextualised response.
+pub fn deliverViaMainAgent(
+    allocator: std.mem.Allocator,
+    delivery: DeliveryConfig,
+    output: []const u8,
+    success: bool,
+    the_bus: *bus.Bus,
+    job_name: []const u8,
+) !bool {
+    // Apply the same filtering as deliverResult
+    if (delivery.mode == .none) return false;
+    const channel = delivery.channel orelse return false;
+    switch (delivery.mode) {
+        .none => return false,
+        .on_success => if (!success) return false,
+        .on_error => if (success) return false,
+        .always => {},
+    }
+    if (output.len == 0) return false;
+
+    const status_tag = if (success) "" else " [FAILED]";
+    const content = try std.fmt.allocPrint(
+        allocator,
+        "[Scheduled task '{s}'{s} completed]\n{s}",
+        .{ job_name, status_tag, output },
+    );
+    defer allocator.free(content);
+
+    const chat_id = delivery.to orelse "default";
+    const session_key = try std.fmt.allocPrint(allocator, "{s}:{s}", .{ channel, chat_id });
+    defer allocator.free(session_key);
+
+    const msg = try bus.makeInbound(allocator, channel, "system:cron", chat_id, content, session_key);
+    the_bus.publishInbound(msg) catch |err| {
         if (delivery.best_effort) {
             msg.deinit(allocator);
             return false;
@@ -1473,6 +1538,8 @@ pub fn saveJobs(scheduler: *const CronScheduler) !void {
         try buf.appendSlice(scheduler.allocator, ",");
         try json_util.appendJsonKey(&buf, scheduler.allocator, "delete_after_run");
         try buf.appendSlice(scheduler.allocator, if (job.delete_after_run) "true" else "false");
+        try buf.appendSlice(scheduler.allocator, ",");
+        try json_util.appendJsonKeyValue(&buf, scheduler.allocator, "session_target", job.session_target.asStr());
 
         // Delivery config for notifications
         try buf.appendSlice(scheduler.allocator, ",");

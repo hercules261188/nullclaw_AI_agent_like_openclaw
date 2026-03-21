@@ -16,9 +16,9 @@ threadlocal var tls_schedule_chat_id: ?[]const u8 = null;
 /// Delegates to the CronScheduler from the cron module for persistent job management.
 pub const ScheduleTool = struct {
     pub const tool_name = "schedule";
-    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Optional delivery params: channel, account_id, chat_id.";
+    pub const tool_description = "Manage scheduled tasks. Actions: create/add/once/list/get/cancel/remove/pause/resume. Optional delivery params: channel, account_id, chat_id. Set session_target to 'main' to route results through the main agent for contextualised delivery.";
     pub const tool_params =
-        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"}},"required":["action"]}
+        \\{"type":"object","properties":{"action":{"type":"string","enum":["create","add","once","list","get","cancel","remove","pause","resume"],"description":"Action to perform"},"expression":{"type":"string","description":"Cron expression for recurring tasks"},"delay":{"type":"string","description":"Delay for one-shot tasks (e.g. '30m', '2h')"},"command":{"type":"string","description":"Shell command to execute"},"id":{"type":"string","description":"Task ID"},"channel":{"type":"string","description":"Delivery channel for notifications (e.g. telegram, signal, matrix)"},"account_id":{"type":"string","description":"Optional channel account ID for multi-account routing"},"chat_id":{"type":"string","description":"Chat ID for delivery notification"},"session_target":{"type":"string","enum":["isolated","main"],"description":"Routing mode: 'isolated' (default) delivers raw output directly; 'main' routes through the main agent session for contextualised responses"}},"required":["action"]}
     ;
 
     const vtable = root.ToolVTable(@This());
@@ -46,6 +46,10 @@ pub const ScheduleTool = struct {
         const explicit_channel = root.getString(args, "channel");
         const explicit_account_id = root.getString(args, "account_id");
         const explicit_chat_id = root.getString(args, "chat_id");
+        const session_target = if (root.getString(args, "session_target")) |st|
+            cron.SessionTarget.parse(st)
+        else
+            cron.SessionTarget.isolated;
 
         // Prefer explicit args; otherwise use per-thread context injected by channel_loop.
         const chat_id = explicit_chat_id orelse tls_schedule_chat_id;
@@ -199,6 +203,8 @@ pub const ScheduleTool = struct {
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
 
+            job.session_target = session_target;
+
             // Set delivery config if chat_id is provided
             if (chat_id) |cid| {
                 job.delivery = .{
@@ -261,6 +267,8 @@ pub const ScheduleTool = struct {
                 const msg = try std.fmt.allocPrint(allocator, "Failed to create one-shot task: {s}", .{@errorName(err)});
                 return ToolResult{ .success = false, .output = "", .error_msg = msg };
             };
+
+            job.session_target = session_target;
 
             // Set delivery config if chat_id is provided
             if (chat_id) |cid| {
