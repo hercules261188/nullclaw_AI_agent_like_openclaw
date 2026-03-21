@@ -10,6 +10,7 @@ const openrouter = @import("openrouter.zig");
 const compatible = @import("compatible.zig");
 const claude_cli = @import("claude_cli.zig");
 const codex_cli = @import("codex_cli.zig");
+const gemini_cli = @import("gemini_cli.zig");
 const openai_codex = @import("openai_codex.zig");
 const provider_names = @import("../provider_names.zig");
 
@@ -24,6 +25,7 @@ pub const ProviderKind = enum {
     compatible_provider,
     claude_cli_provider,
     codex_cli_provider,
+    gemini_cli_provider,
     openai_codex_provider,
     unknown,
 };
@@ -236,6 +238,7 @@ const core_providers = std.StaticStringMap(ProviderKind).initComptime(.{
     .{ "google-vertex", .vertex_provider },
     .{ "claude-cli", .claude_cli_provider },
     .{ "codex-cli", .codex_cli_provider },
+    .{ "gemini-cli", .gemini_cli_provider },
     .{ "openai-codex", .openai_codex_provider },
 });
 
@@ -297,6 +300,7 @@ pub const ProviderHolder = union(enum) {
     compatible: compatible.OpenAiCompatibleProvider,
     claude_cli: claude_cli.ClaudeCliProvider,
     codex_cli: codex_cli.CodexCliProvider,
+    gemini_cli: gemini_cli.GeminiCliProvider,
     openai_codex: openai_codex.OpenAiCodexProvider,
 
     /// Obtain the vtable-based Provider interface from whichever variant is active.
@@ -311,6 +315,7 @@ pub const ProviderHolder = union(enum) {
             .compatible => |*p| p.provider(),
             .claude_cli => |*p| p.provider(),
             .codex_cli => |*p| p.provider(),
+            .gemini_cli => |*p| p.provider(),
             .openai_codex => |*p| p.provider(),
         };
     }
@@ -410,6 +415,10 @@ pub const ProviderHolder = union(enum) {
                 .{ .codex_cli = p }
             else |_|
                 .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
+            .gemini_cli_provider => if (gemini_cli.GeminiCliProvider.init(allocator, null)) |p|
+                .{ .gemini_cli = p }
+            else |_|
+                .{ .openrouter = openrouter.OpenRouterProvider.init(allocator, api_key) },
             .openai_codex_provider => .{ .openai_codex = openai_codex.OpenAiCodexProvider.init(allocator, null) },
             // Unknown provider: if base_url is configured, treat as OpenAI-compatible;
             // otherwise fall back to OpenRouter.
@@ -454,6 +463,7 @@ test "classifyProvider identifies known providers" {
     try std.testing.expect(classifyProvider("poe") == .compatible_provider);
     try std.testing.expect(classifyProvider("custom:https://example.com") == .compatible_provider);
     try std.testing.expect(classifyProvider("openai-codex") == .openai_codex_provider);
+    try std.testing.expect(classifyProvider("gemini-cli") == .gemini_cli_provider);
     try std.testing.expect(classifyProvider("nonexistent") == .unknown);
 }
 
@@ -870,6 +880,7 @@ test "ProviderHolder tagged union has all expected fields" {
     try std.testing.expect(@hasField(ProviderHolder, "compatible"));
     try std.testing.expect(@hasField(ProviderHolder, "claude_cli"));
     try std.testing.expect(@hasField(ProviderHolder, "codex_cli"));
+    try std.testing.expect(@hasField(ProviderHolder, "gemini_cli"));
     try std.testing.expect(@hasField(ProviderHolder, "openai_codex"));
 }
 

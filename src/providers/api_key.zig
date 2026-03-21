@@ -343,6 +343,7 @@ fn providerEnvCandidates(name: []const u8) [3][]const u8 {
         .{ "lm-studio", .{ "API_KEY", "", "" } },
         .{ "claude-cli", .{ "ANTHROPIC_API_KEY", "", "" } },
         .{ "codex-cli", .{ "OPENAI_API_KEY", "", "" } },
+        .{ "gemini-cli", .{ "GEMINI_API_KEY", "", "" } },
     });
     return map.get(canonical) orelse .{ "", "", "" };
 }
