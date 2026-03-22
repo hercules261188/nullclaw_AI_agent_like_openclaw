@@ -1,6 +1,4 @@
-Want a simpler way to install and configure nullclaw with a UI?
-
-[nullhub](https://github.com/nullclaw/nullhub) is currently in beta.
+Want a simpler way to install and configure nullclaw with a UI? Try [nullhub](https://github.com/nullclaw/nullhub)! (currently in beta)
 
 [nullhub](https://github.com/nullclaw/nullhub) provides a UI layer for the Null ecosystem: simpler nullclaw setup and configuration, orchestration from [nullboiler](https://github.com/nullclaw/nullboiler), observability from [nullwatch](https://github.com/nullclaw/nullwatch), and task tracking from [nulltickets](https://github.com/nullclaw/nulltickets).
 
