@@ -504,6 +504,8 @@ pub const ContextCore = struct {
     pub fn compactEvents(self: *Self) !usize {
         const db = self.db orelse return error.Unavailable;
         const latest = try self.lastEventSequence();
+        if (latest == 0) return 0;
+
         try execSql(db, "BEGIN IMMEDIATE;");
         errdefer execSql(db, "ROLLBACK;") catch {};
         try self.setMetaU64Tx("compacted_through_sequence", latest);
@@ -513,8 +515,9 @@ pub const ContextCore = struct {
         defer _ = c.sqlite3_finalize(stmt);
         _ = c.sqlite3_bind_int64(stmt, 1, @intCast(latest));
         if (c.sqlite3_step(stmt) != c.SQLITE_DONE) return error.StepFailed;
+        const removed: usize = @intCast(c.sqlite3_changes(db));
         try execSql(db, "COMMIT;");
-        return try self.count();
+        return removed;
     }
 
     pub fn rebuildStateFromEvents(self: *Self) !void {
@@ -1369,6 +1372,23 @@ test "context core compaction expires stale cursors" {
 
     _ = try core.compactEvents();
     try std.testing.expectError(error.CursorExpired, core.listEvents(std.testing.allocator, 0, 8));
+}
+
+test "context core compaction returns removed event count" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    var core = try ContextCore.init(std.testing.allocator, workspace, "agent-a");
+    defer core.deinit();
+
+    _ = try core.store("pref", "vim", .core, null);
+    _ = try core.store("pref", "helix", .core, null);
+    try std.testing.expectEqual(@as(usize, 1), try core.count());
+
+    const compacted = try core.compactEvents();
+    try std.testing.expectEqual(@as(usize, 2), compacted);
 }
 
 test "context core imports legacy journal on first init" {

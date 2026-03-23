@@ -22,9 +22,9 @@ pub const BackendCapabilities = struct {
     supports_session_store: bool, // saveMessage / loadMessages
     supports_transactions: bool, // BEGIN / COMMIT
     supports_outbox: bool, // durable vector-sync
-    supports_native_recall: bool,
-    supports_scoped_native_recall: bool,
-    supports_safe_rebuild: bool,
+    supports_native_recall: bool, // projection recall is safe to use instead of the canonical core
+    supports_scoped_native_recall: bool, // projection recall preserves per-session scope fidelity
+    supports_safe_rebuild: bool, // projection can be deterministically rebuilt from the canonical core
     has_remote_side_effects: bool,
 };
 
@@ -117,7 +117,7 @@ const lucid_backend = BackendDescriptor{
 
 const memory_backend = BackendDescriptor{
     .name = "memory",
-    .label = "In-memory LRU — no persistence, ideal for testing",
+    .label = "In-memory projection over durable context core",
     .auto_save_default = false,
     .capabilities = .{
         .supports_keyword_rank = false,
@@ -136,14 +136,14 @@ const memory_backend = BackendDescriptor{
 
 const redis_backend = BackendDescriptor{
     .name = "redis",
-    .label = "Redis — distributed in-memory store with optional TTL",
+    .label = "Redis — projection/cache over durable context core",
     .auto_save_default = true,
     .capabilities = .{
         .supports_keyword_rank = false,
         .supports_session_store = false,
         .supports_transactions = false,
         .supports_outbox = false,
-        .supports_native_recall = true,
+        .supports_native_recall = false,
         .supports_scoped_native_recall = false,
         .supports_safe_rebuild = false,
         .has_remote_side_effects = true,
@@ -155,14 +155,14 @@ const redis_backend = BackendDescriptor{
 
 const lancedb_backend = BackendDescriptor{
     .name = "lancedb",
-    .label = "LanceDB — SQLite + vector-augmented recall",
+    .label = "LanceDB — vector projection over durable context core",
     .auto_save_default = true,
     .capabilities = .{
         .supports_keyword_rank = false,
         .supports_session_store = false,
         .supports_transactions = false,
         .supports_outbox = false,
-        .supports_native_recall = true,
+        .supports_native_recall = false,
         .supports_scoped_native_recall = false,
         .supports_safe_rebuild = false,
         .has_remote_side_effects = false,
@@ -174,14 +174,14 @@ const lancedb_backend = BackendDescriptor{
 
 const api_backend = BackendDescriptor{
     .name = "api",
-    .label = "HTTP API — delegate to external REST service",
+    .label = "HTTP API — projection/export bridge over durable context core",
     .auto_save_default = true,
     .capabilities = .{
         .supports_keyword_rank = false,
         .supports_session_store = true,
         .supports_transactions = false,
         .supports_outbox = false,
-        .supports_native_recall = true,
+        .supports_native_recall = false,
         .supports_scoped_native_recall = false,
         .supports_safe_rebuild = false,
         .has_remote_side_effects = true,
@@ -193,7 +193,7 @@ const api_backend = BackendDescriptor{
 
 const none_backend = BackendDescriptor{
     .name = "none",
-    .label = "None — disable persistent memory",
+    .label = "Core-only memory — no projection backend",
     .auto_save_default = false,
     .capabilities = .{
         .supports_keyword_rank = false,
@@ -265,14 +265,14 @@ const lancedb_backends = if (build_options.enable_memory_lancedb) [_]BackendDesc
 
 const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
     .name = "postgres",
-    .label = "PostgreSQL — remote/shared memory store",
+    .label = "PostgreSQL — projection over durable context core",
     .auto_save_default = true,
     .capabilities = .{
         .supports_keyword_rank = false,
         .supports_session_store = true,
         .supports_transactions = true,
         .supports_outbox = true,
-        .supports_native_recall = true,
+        .supports_native_recall = false,
         .supports_scoped_native_recall = false,
         .supports_safe_rebuild = false,
         .has_remote_side_effects = true,
@@ -284,14 +284,14 @@ const pg_backends = if (build_options.enable_postgres) [_]BackendDescriptor{.{
 
 const clickhouse_backends = if (build_options.enable_memory_clickhouse) [_]BackendDescriptor{.{
     .name = "clickhouse",
-    .label = "ClickHouse — columnar analytics memory store",
+    .label = "ClickHouse — analytics projection over durable context core",
     .auto_save_default = true,
     .capabilities = .{
         .supports_keyword_rank = false,
         .supports_session_store = true,
         .supports_transactions = false,
         .supports_outbox = false,
-        .supports_native_recall = true,
+        .supports_native_recall = false,
         .supports_scoped_native_recall = false,
         .supports_safe_rebuild = false,
         .has_remote_side_effects = true,

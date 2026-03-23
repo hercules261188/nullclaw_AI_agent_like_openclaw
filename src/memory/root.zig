@@ -1976,6 +1976,7 @@ const ContextBackedMemory = struct {
     projection_capabilities: BackendCapabilities,
     projection_backend_name: []const u8,
     projection_last_applied_sequence: u64 = 0,
+    projection_trusted: bool = false,
     native_recall_enabled: bool = false,
     owns_self: bool = false,
 
@@ -2012,6 +2013,7 @@ const ContextBackedMemory = struct {
             const latest_after_bootstrap = try self.core.lastEventSequence();
             try self.core.setProjectionSequence(self.projection_backend_name, latest_after_bootstrap);
             self.projection_last_applied_sequence = latest_after_bootstrap;
+            self.projection_trusted = true;
         } else {
             self.projection_last_applied_sequence = try self.core.getProjectionSequence(self.projection_backend_name);
         }
@@ -2039,28 +2041,35 @@ const ContextBackedMemory = struct {
         if (self.owns_self) self.allocator.destroy(self);
     }
 
+    fn refreshNativeRecallEnabled(self: *Self) void {
+        self.native_recall_enabled = self.projection_trusted and self.projection_capabilities.supports_native_recall;
+    }
+
     fn reconcileProjection(self: *Self) !void {
         const latest = try self.core.lastEventSequence();
-        if (self.projection_last_applied_sequence >= latest) {
-            self.native_recall_enabled = self.projection_capabilities.supports_native_recall;
+        if (latest == 0) {
+            self.projection_trusted = true;
+            self.refreshNativeRecallEnabled();
             return;
         }
 
         if (self.projection_capabilities.supports_safe_rebuild) {
-            try self.rebuildProjectionFromCore();
-            self.native_recall_enabled = self.projection_capabilities.supports_native_recall;
+            if (self.projection_last_applied_sequence < latest) {
+                try self.rebuildProjectionFromCore();
+                return;
+            }
+            self.projection_trusted = true;
+            self.refreshNativeRecallEnabled();
             return;
         }
 
-        self.native_recall_enabled = false;
-
-        if (self.projection_last_applied_sequence == 0 and latest > 0) {
-            const projection_count = self.projection.count() catch 0;
-            const core_count = self.core.count() catch 0;
-            if (projection_count == core_count) {
-                try self.rememberProjectionProgress(latest);
-            }
+        if (self.projection_trusted and self.projection_last_applied_sequence >= latest) {
+            self.refreshNativeRecallEnabled();
+            return;
         }
+
+        self.projection_trusted = false;
+        self.refreshNativeRecallEnabled();
     }
 
     fn shouldUseNativeRecall(self: *Self, session_id: ?[]const u8) bool {
@@ -2083,7 +2092,8 @@ const ContextBackedMemory = struct {
                 const category = event.category orelse return;
                 self.projection.store(event.key, content, category, event.session_id) catch |err| {
                     log.warn("memory projection put failed for backend '{s}' key '{s}': {}", .{ self.projection_backend_name, event.key, err });
-                    self.native_recall_enabled = false;
+                    self.projection_trusted = false;
+                    self.refreshNativeRecallEnabled();
                     return;
                 };
                 success = true;
@@ -2091,7 +2101,8 @@ const ContextBackedMemory = struct {
             .delete_all => {
                 const entries = self.projection.list(self.allocator, null, null) catch |err| {
                     log.warn("memory projection delete-all list failed for backend '{s}' key '{s}': {}", .{ self.projection_backend_name, event.key, err });
-                    self.native_recall_enabled = false;
+                    self.projection_trusted = false;
+                    self.refreshNativeRecallEnabled();
                     return;
                 };
                 defer freeEntries(self.allocator, entries);
@@ -2118,7 +2129,8 @@ const ContextBackedMemory = struct {
 
                 if (any_failed) {
                     log.warn("memory projection delete-all degraded for backend '{s}' key '{s}'", .{ self.projection_backend_name, event.key });
-                    self.native_recall_enabled = false;
+                    self.projection_trusted = false;
+                    self.refreshNativeRecallEnabled();
                     return;
                 }
                 success = true;
@@ -2127,13 +2139,15 @@ const ContextBackedMemory = struct {
                 if (self.projection.vtable.forgetScoped) |_| {
                     _ = self.projection.forgetScoped(self.allocator, event.key, event.session_id) catch |err| {
                         log.warn("memory projection scoped delete failed for backend '{s}' key '{s}': {}", .{ self.projection_backend_name, event.key, err });
-                        self.native_recall_enabled = false;
+                        self.projection_trusted = false;
+                        self.refreshNativeRecallEnabled();
                         return;
                     };
                     success = true;
                 } else {
                     log.info("memory projection backend '{s}' does not support scoped delete for key '{s}'", .{ self.projection_backend_name, event.key });
-                    self.native_recall_enabled = false;
+                    self.projection_trusted = false;
+                    self.refreshNativeRecallEnabled();
                     return;
                 }
             },
@@ -2142,7 +2156,8 @@ const ContextBackedMemory = struct {
         if (success) {
             self.rememberProjectionProgress(sequence) catch |err| {
                 log.warn("memory projection checkpoint update failed for backend '{s}': {}", .{ self.projection_backend_name, err });
-                self.native_recall_enabled = false;
+                self.projection_trusted = false;
+                self.refreshNativeRecallEnabled();
             };
         }
     }
@@ -2241,6 +2256,8 @@ const ContextBackedMemory = struct {
         }
 
         try self.rememberProjectionProgress(try self.core.lastEventSequence());
+        self.projection_trusted = true;
+        self.refreshNativeRecallEnabled();
     }
 
     fn feedInfo(self: *Self) !MemoryEventFeedInfo {
@@ -4038,6 +4055,72 @@ test "context backed memory falls back to core for scoped recall and degrades un
     try std.testing.expectEqualStrings("core", info.recall_source);
 
     try std.testing.expectError(error.NotSupported, mem.rebuildProjection());
+}
+
+test "context backed memory does not trust persisted projection progress for unsafe backends after restart" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(workspace);
+
+    {
+        var projection = memory_lru.InMemoryLruMemory.init(std.testing.allocator, 32);
+        const mem = try wrapContextBackedMemory(
+            std.testing.allocator,
+            projection.memory(),
+            "api",
+            .{
+                .supports_keyword_rank = false,
+                .supports_session_store = false,
+                .supports_transactions = false,
+                .supports_outbox = false,
+                .supports_native_recall = true,
+                .supports_scoped_native_recall = false,
+                .supports_safe_rebuild = false,
+                .has_remote_side_effects = true,
+            },
+            workspace,
+            "agent-a",
+        );
+        defer mem.deinit();
+
+        try mem.store("pref", "core-value", .core, null);
+
+        const info = try mem.eventFeedInfo();
+        try std.testing.expectEqualStrings("projection", info.recall_source);
+    }
+
+    {
+        var projection = memory_lru.InMemoryLruMemory.init(std.testing.allocator, 32);
+        const mem = try wrapContextBackedMemory(
+            std.testing.allocator,
+            projection.memory(),
+            "api",
+            .{
+                .supports_keyword_rank = false,
+                .supports_session_store = false,
+                .supports_transactions = false,
+                .supports_outbox = false,
+                .supports_native_recall = true,
+                .supports_scoped_native_recall = false,
+                .supports_safe_rebuild = false,
+                .has_remote_side_effects = true,
+            },
+            workspace,
+            "agent-a",
+        );
+        defer mem.deinit();
+
+        const info = try mem.eventFeedInfo();
+        try std.testing.expectEqual(@as(u64, 1), info.latest_sequence);
+        try std.testing.expectEqual(@as(u64, 1), info.projection_last_applied_sequence);
+        try std.testing.expectEqualStrings("core", info.recall_source);
+
+        const recalled = try mem.recall(std.testing.allocator, "pref", 4, null);
+        defer freeEntries(std.testing.allocator, recalled);
+        try std.testing.expectEqual(@as(usize, 1), recalled.len);
+        try std.testing.expectEqualStrings("core-value", recalled[0].content);
+    }
 }
 
 test "SessionStore delegates through vtable" {

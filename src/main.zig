@@ -1517,7 +1517,7 @@ fn runMemory(allocator: std.mem.Allocator, sub_args: []const []const u8) !void {
             std.process.exit(1);
         };
         std.debug.print(
-            "Memory compact complete: checkpointed {d} entry(s), compacted through sequence {d}.\n",
+            "Memory compact complete: removed {d} event(s), compacted through sequence {d}.\n",
             .{ compacted, feed_info.compacted_through_sequence },
         );
         return;
