@@ -372,7 +372,7 @@ fn createRedis(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstanc
 fn createLanceDb(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     const impl_ = try allocator.create(lancedb_engine.LanceDbMemory);
     errdefer allocator.destroy(impl_);
-    impl_.* = try lancedb_engine.LanceDbMemory.init(allocator, cfg.db_path.?, null, .{});
+    impl_.* = try lancedb_engine.LanceDbMemory.initWithInstanceId(allocator, cfg.db_path.?, cfg.instance_id, null, .{});
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = null };
 }
