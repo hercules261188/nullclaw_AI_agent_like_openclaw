@@ -1028,7 +1028,7 @@ fn printWorkspaceUsage() void {
         \\Commands:
         \\  edit <filename>
         \\      Open a bootstrap file (SOUL.md, AGENTS.md, etc.) in $EDITOR.
-        \\      For file-based backends (markdown, hybrid) edits the file directly.
+        \\      For the markdown backend edits the file directly.
         \\      For DB-backed backends, use the agent's memory_store tool instead.
         \\
         \\  reset-md [--dry-run] [--include-bootstrap] [--clear-memory-md]
@@ -2686,12 +2686,12 @@ fn runWorkspaceEdit(allocator: std.mem.Allocator, args: []const []const u8, cfg:
         std.process.exit(1);
     }
 
-    // Only file-based backends (markdown, hybrid) support direct editing.
+    // Only the markdown backend supports direct editing.
     if (!yc.memory.usesWorkspaceBootstrapFiles(cfg.memory.backend)) {
         std.debug.print(
             "The '{s}' backend stores bootstrap files in the database.\n" ++
                 "Edit bootstrap files through the agent using the memory_store tool,\n" ++
-                "or switch to the hybrid backend for file-based editing.\n",
+                "or switch to the markdown backend for file-based editing.\n",
             .{cfg.memory.backend},
         );
         std.process.exit(1);

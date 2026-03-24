@@ -895,16 +895,10 @@ pub const MarkdownMemory = struct {
 
     fn implRecall(ptr: *anyopaque, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) anyerror![]MemoryEntry {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-        try self_.ensureProjectionUpToDate();
-        return self_.projectionMemory().recall(allocator, query, limit, session_id) catch |err| {
-            if (err != error.NotSupported) {
-                log.warn("projection recall failed for markdown journal {s}: {}; falling back to canonical recall", .{
-                    self_.journal_path,
-                    err,
-                });
-            }
-            return self_.recallCanonical(allocator, query, limit, session_id);
-        };
+        var file = try self_.openJournalShared();
+        defer file.close();
+        try self_.refreshJournalLocked(&file);
+        return self_.recallCanonical(allocator, query, limit, session_id);
     }
 
     fn implGet(ptr: *anyopaque, allocator: std.mem.Allocator, key: []const u8) anyerror!?MemoryEntry {
@@ -1128,8 +1122,12 @@ pub const MarkdownMemory = struct {
         defer decision.deinit(self.allocator);
         const next_sequence = self.last_sequence + 1;
         const end_offset = try self.appendEventLineLocked(file, next_sequence, input, decision.effect, decision.resolved_state);
-        try self.applyMetadataUpdate(next_sequence, input, decision.effect, decision.resolved_state);
         self.loaded_size_bytes = end_offset;
+        self.applyMetadataUpdate(next_sequence, input, decision.effect, decision.resolved_state) catch |err| {
+            log.warn("markdown journal append committed before metadata update; reloading canonical state from disk: {}", .{err});
+            try self.reloadCanonicalStateLocked(file);
+            return true;
+        };
         return true;
     }
 
@@ -1179,11 +1177,15 @@ pub const MarkdownMemory = struct {
         const read_buf = try self.allocator.alloc(u8, MAX_EVENT_LINE_BYTES);
         defer self.allocator.free(read_buf);
         var reader = file.readerStreaming(read_buf);
+        var saw_any = false;
+        var saw_meta = false;
         while (try reader.interface.takeDelimiter('\n')) |line_with_no_delim| {
             const line = std.mem.trim(u8, line_with_no_delim, " \t\r\n");
             if (line.len == 0) continue;
-            try self.applyCheckpointLine(line);
+            saw_any = true;
+            if (try self.applyCheckpointLine(line)) saw_meta = true;
         }
+        if (saw_any and !saw_meta) return error.InvalidEvent;
     }
 
     fn loadJournalFromOffsetLocked(self: *Self, file: *std.fs.File, start_offset: u64) !void {
@@ -1221,6 +1223,14 @@ pub const MarkdownMemory = struct {
         self.projection_offset_bytes = 0;
         self.compacted_through_sequence = self.last_sequence;
         return self.compacted_through_sequence;
+    }
+
+    fn reloadCanonicalStateLocked(self: *Self, file: *std.fs.File) !void {
+        self.clearJournalState();
+        try self.loadCheckpoint();
+        try self.loadJournalFromOffsetLocked(file, 0);
+        try self.rebuildProjectionFromCanonical();
+        self.projection_offset_bytes = self.loaded_size_bytes;
     }
 
     fn rebuildProjectionFromCanonical(self: *Self) !void {
@@ -1314,11 +1324,15 @@ pub const MarkdownMemory = struct {
         defer scratch.deinitMembers();
 
         var lines = std.mem.splitScalar(u8, payload, '\n');
+        var saw_any = false;
+        var saw_meta = false;
         while (lines.next()) |raw_line| {
             const line = std.mem.trim(u8, raw_line, " \t\r\n");
             if (line.len == 0) continue;
-            try scratch.applyCheckpointLine(line);
+            saw_any = true;
+            if (try scratch.applyCheckpointLine(line)) saw_meta = true;
         }
+        if (!saw_any or !saw_meta) return error.InvalidEvent;
 
         var checkpoint_file = try std.fs.createFileAbsolute(self.checkpoint_path, .{
             .truncate = true,
@@ -1434,7 +1448,7 @@ pub const MarkdownMemory = struct {
         try writer.writeAll(payload.items);
     }
 
-    fn applyCheckpointLine(self: *Self, line: []const u8) !void {
+    fn applyCheckpointLine(self: *Self, line: []const u8) !bool {
         var parsed = try std.json.parseFromSlice(std.json.Value, self.allocator, line, .{});
         defer parsed.deinit();
 
@@ -1445,13 +1459,13 @@ pub const MarkdownMemory = struct {
             self.last_sequence = jsonUnsignedField(parsed.value, "last_sequence") orelse 0;
             self.last_timestamp_ms = jsonIntegerField(parsed.value, "last_timestamp_ms") orelse 0;
             self.compacted_through_sequence = jsonUnsignedField(parsed.value, "compacted_through_sequence") orelse self.last_sequence;
-            return;
+            return true;
         }
         if (std.mem.eql(u8, kind, "frontier")) {
             const origin_instance_id = jsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
             const origin_sequence = jsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
             try self.rememberOriginFrontier(origin_instance_id, origin_sequence);
-            return;
+            return false;
         }
         if (std.mem.eql(u8, kind, "state")) {
             const key = jsonStringField(parsed.value, "key") orelse return error.InvalidEvent;
@@ -1479,7 +1493,7 @@ pub const MarkdownMemory = struct {
                 origin_instance_id,
                 origin_sequence,
             );
-            return;
+            return false;
         }
         if (std.mem.eql(u8, kind, "scoped_tombstone") or std.mem.eql(u8, kind, "key_tombstone")) {
             const key = jsonStringField(parsed.value, "key") orelse return error.InvalidEvent;
@@ -1487,7 +1501,7 @@ pub const MarkdownMemory = struct {
             const origin_instance_id = jsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
             const origin_sequence = jsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
             try self.restoreCheckpointTombstone(kind, key, timestamp_ms, origin_instance_id, origin_sequence);
-            return;
+            return false;
         }
         return error.InvalidEvent;
     }
@@ -2455,4 +2469,97 @@ test "markdown native feed roundtrip across workspaces" {
     const lang = (try dst.getScoped(std.testing.allocator, "prefs/lang", "sess-b")).?;
     defer lang.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("zig", lang.content);
+}
+
+test "markdown recall ignores out-of-band projection edits" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.initWithInstanceId(std.testing.allocator, base, "agent-a");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("traits/tone", "formal", .core, null);
+
+    const memory_path = try std.fs.path.join(std.testing.allocator, &.{ base, "MEMORY.md" });
+    defer std.testing.allocator.free(memory_path);
+    try MarkdownProjectionMemory.writeFileContents(
+        memory_path,
+        "- **traits/tone**: casual <!-- nullclaw:category=core;session= -->",
+        std.testing.allocator,
+    );
+
+    const formal = try m.recall(std.testing.allocator, "formal", 8, null);
+    defer root.freeEntries(std.testing.allocator, formal);
+    try std.testing.expectEqual(@as(usize, 1), formal.len);
+    try std.testing.expectEqualStrings("formal", formal[0].content);
+
+    const casual = try m.recall(std.testing.allocator, "casual", 8, null);
+    defer root.freeEntries(std.testing.allocator, casual);
+    try std.testing.expectEqual(@as(usize, 0), casual.len);
+}
+
+test "markdown checkpoint requires meta and preserves state on invalid payload" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var mem = try MarkdownMemory.initWithInstanceId(std.testing.allocator, base, "agent-a");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("prefs/theme", "solarized", .core, null);
+
+    const invalid_checkpoint =
+        \\{"kind":"state","key":"prefs/theme","session_id":null,"category":"core","value_kind":null,"content":"dracula","timestamp_ms":1,"origin_instance_id":"agent-a","origin_sequence":1}
+        \\
+    ;
+
+    try std.testing.expectError(error.InvalidEvent, m.applyCheckpoint(invalid_checkpoint));
+
+    const entry = (try m.get(std.testing.allocator, "prefs/theme")).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("solarized", entry.content);
+}
+
+test "markdown compaction enforces cursor floor and survives reopen" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var compacted_through: u64 = 0;
+    {
+        var mem = try MarkdownMemory.initWithInstanceId(std.testing.allocator, base, "agent-a");
+        defer mem.deinit();
+        const m = mem.memory();
+
+        try m.store("prefs/theme", "dark", .core, null);
+        compacted_through = try m.compactEvents();
+        try std.testing.expect(compacted_through > 0);
+        try std.testing.expectError(error.CursorExpired, m.listEvents(std.testing.allocator, 0, 8));
+
+        const info = try m.eventFeedInfo(std.testing.allocator);
+        defer info.deinit(std.testing.allocator);
+        try std.testing.expectEqual(compacted_through, info.compacted_through_sequence);
+        try std.testing.expectEqual(compacted_through + 1, info.oldest_available_sequence);
+    }
+
+    {
+        var reopened = try MarkdownMemory.initWithInstanceId(std.testing.allocator, base, "agent-a");
+        defer reopened.deinit();
+        const m = reopened.memory();
+
+        const entry = (try m.get(std.testing.allocator, "prefs/theme")).?;
+        defer entry.deinit(std.testing.allocator);
+        try std.testing.expectEqualStrings("dark", entry.content);
+        try std.testing.expectEqual(compacted_through, try m.lastEventSequence());
+
+        const tail = try m.listEvents(std.testing.allocator, compacted_through, 8);
+        defer root.freeEvents(std.testing.allocator, tail);
+        try std.testing.expectEqual(@as(usize, 0), tail.len);
+    }
 }

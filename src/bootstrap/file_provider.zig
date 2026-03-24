@@ -7,7 +7,7 @@ const memory_root = @import("../memory/root.zig");
 
 pub const Error = error{NotBootstrapFile};
 
-/// Disk-based BootstrapProvider for hybrid/markdown backends.
+/// Disk-based BootstrapProvider for markdown backends.
 /// Stores bootstrap documents as files in the workspace directory.
 pub const FileBootstrapProvider = struct {
     allocator: std.mem.Allocator,

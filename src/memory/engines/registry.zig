@@ -138,7 +138,7 @@ const none_backend = BackendDescriptor{
 const hybrid_backends = if (build_options.enable_memory_sqlite) [_]BackendDescriptor{
     .{
         .name = "hybrid",
-        .label = "Hybrid: SQLite + Markdown",
+        .label = "Hybrid: SQLite-backed local memory (default)",
         .auto_save_default = true,
         .capabilities = .{
             .supports_keyword_rank = true,
@@ -147,7 +147,7 @@ const hybrid_backends = if (build_options.enable_memory_sqlite) [_]BackendDescri
             .supports_outbox = true,
         },
         .needs_db_path = true,
-        .needs_workspace = true,
+        .needs_workspace = false,
         .create = &createHybrid,
     },
 } else [0]BackendDescriptor{};
@@ -485,6 +485,22 @@ test "findBackend sqlite" {
     }
     const desc = findBackend("sqlite") orelse return error.TestUnexpectedResult;
     try std.testing.expectEqualStrings("sqlite", desc.name);
+    try std.testing.expect(desc.capabilities.supports_keyword_rank);
+    try std.testing.expect(desc.capabilities.supports_session_store);
+    try std.testing.expect(desc.capabilities.supports_transactions);
+    try std.testing.expect(desc.capabilities.supports_outbox);
+    try std.testing.expect(desc.needs_db_path);
+    try std.testing.expect(!desc.needs_workspace);
+    try std.testing.expect(desc.auto_save_default);
+}
+
+test "findBackend hybrid" {
+    if (!build_options.enable_memory_sqlite) {
+        try std.testing.expect(findBackend("hybrid") == null);
+        return;
+    }
+    const desc = findBackend("hybrid") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("hybrid", desc.name);
     try std.testing.expect(desc.capabilities.supports_keyword_rank);
     try std.testing.expect(desc.capabilities.supports_session_store);
     try std.testing.expect(desc.capabilities.supports_transactions);

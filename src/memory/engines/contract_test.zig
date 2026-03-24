@@ -14,6 +14,7 @@ const NoneMemory = @import("none.zig").NoneMemory;
 const MarkdownMemory = @import("markdown.zig").MarkdownMemory;
 const InMemoryLruMemory = @import("memory_lru.zig").InMemoryLruMemory;
 const LanceDbMemory = if (build_options.enable_memory_lancedb and build_options.enable_sqlite) @import("lancedb.zig").LanceDbMemory else struct {};
+const registry = @import("registry.zig");
 
 // ── Contract: common invariants ─────────────────────────────────────
 
@@ -216,20 +217,43 @@ fn contractScopedNamespaces(m: Memory) !void {
     try m.store("shared", "global content", .core, null);
     try m.store("shared", "session A content", .conversation, "sess-a");
     try m.store("shared", "session B content", .daily, "sess-b");
+    try m.store("scoped-only", "session only", .core, "sess-a");
 
-    try std.testing.expectEqual(@as(usize, 3), try m.count());
+    try std.testing.expectEqual(@as(usize, 4), try m.count());
 
     try expectScopedEntry(m, "shared", null, "global content");
     try expectScopedEntry(m, "shared", "sess-a", "session A content");
     try expectScopedEntry(m, "shared", "sess-b", "session B content");
 
     {
+        const global_get = try m.get(allocator, "shared");
+        try std.testing.expect(global_get != null);
+        defer global_get.?.deinit(allocator);
+        try std.testing.expect(global_get.?.session_id == null);
+        try std.testing.expectEqualStrings("global content", global_get.?.content);
+    }
+
+    try std.testing.expect(try m.get(allocator, "scoped-only") == null);
+
+    {
         const sess_a_entries = try m.list(allocator, null, "sess-a");
         defer root.freeEntries(allocator, sess_a_entries);
-        try std.testing.expectEqual(@as(usize, 1), sess_a_entries.len);
-        try std.testing.expect(sess_a_entries[0].session_id != null);
-        try std.testing.expectEqualStrings("sess-a", sess_a_entries[0].session_id.?);
-        try std.testing.expectEqualStrings("session A content", sess_a_entries[0].content);
+        try std.testing.expectEqual(@as(usize, 2), sess_a_entries.len);
+        var found_shared = false;
+        var found_scoped_only = false;
+        for (sess_a_entries) |entry| {
+            try std.testing.expect(entry.session_id != null);
+            try std.testing.expectEqualStrings("sess-a", entry.session_id.?);
+            if (std.mem.eql(u8, entry.key, "shared")) {
+                try std.testing.expectEqualStrings("session A content", entry.content);
+                found_shared = true;
+            } else if (std.mem.eql(u8, entry.key, "scoped-only")) {
+                try std.testing.expectEqualStrings("session only", entry.content);
+                found_scoped_only = true;
+            }
+        }
+        try std.testing.expect(found_shared);
+        try std.testing.expect(found_scoped_only);
     }
 
     {
@@ -245,12 +269,27 @@ fn contractScopedNamespaces(m: Memory) !void {
     try std.testing.expect(try m.getScoped(allocator, "shared", "sess-a") == null);
     try expectScopedEntry(m, "shared", null, "global content");
     try expectScopedEntry(m, "shared", "sess-b", "session B content");
-    try std.testing.expectEqual(@as(usize, 2), try m.count());
+    try expectScopedEntry(m, "scoped-only", "sess-a", "session only");
+    try std.testing.expectEqual(@as(usize, 3), try m.count());
 
     try std.testing.expect(try m.forget("shared"));
     try std.testing.expect(try m.getScoped(allocator, "shared", null) == null);
     try std.testing.expect(try m.getScoped(allocator, "shared", "sess-b") == null);
-    try std.testing.expectEqual(@as(usize, 0), try m.count());
+    try expectScopedEntry(m, "scoped-only", "sess-a", "session only");
+    try std.testing.expectEqual(@as(usize, 1), try m.count());
+}
+
+fn createHybridInstance(allocator: std.mem.Allocator, workspace_dir: []const u8) !registry.BackendInstance {
+    const desc = registry.findBackend("hybrid") orelse return error.TestUnexpectedResult;
+    const cfg = try registry.resolvePaths(allocator, desc, workspace_dir, "default", null, null, null, null);
+    errdefer {
+        if (cfg.postgres_url) |pu| allocator.free(std.mem.span(pu));
+        if (cfg.db_path) |p| allocator.free(std.mem.span(p));
+    }
+    const instance = try desc.create(allocator, cfg);
+    if (cfg.postgres_url) |pu| allocator.free(std.mem.span(pu));
+    if (cfg.db_path) |p| allocator.free(std.mem.span(p));
+    return instance;
 }
 
 // ── SQLite tests ─────────────────────────────────────────────────────
@@ -274,6 +313,42 @@ test "contract: sqlite scoped namespaces" {
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     try contractScopedNamespaces(mem.memory());
+}
+
+test "contract: hybrid basics" {
+    if (!build_options.enable_sqlite) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var instance = try createHybridInstance(std.testing.allocator, base);
+    defer instance.memory.deinit();
+    try contractBasics(instance.memory);
+}
+
+test "contract: hybrid crud" {
+    if (!build_options.enable_sqlite) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var instance = try createHybridInstance(std.testing.allocator, base);
+    defer instance.memory.deinit();
+    try contractCrud(instance.memory);
+}
+
+test "contract: hybrid scoped namespaces" {
+    if (!build_options.enable_sqlite) return;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const base = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
+    defer std.testing.allocator.free(base);
+
+    var instance = try createHybridInstance(std.testing.allocator, base);
+    defer instance.memory.deinit();
+    try contractScopedNamespaces(instance.memory);
 }
 
 // ── NoneMemory tests ─────────────────────────────────────────────────

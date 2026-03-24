@@ -2657,8 +2657,8 @@ fn writeIfMissing(allocator: std.mem.Allocator, dir: []const u8, filename: []con
 
 /// Write-if-missing with optional BootstrapProvider routing.
 /// When a provider is set, stores the content through the provider only.
-/// File-based providers (hybrid/markdown) write to disk themselves;
-/// memory-based providers (sqlite, postgres, …) store in the backend.
+/// File-based providers (markdown) write to disk themselves;
+/// memory-based providers (hybrid, sqlite, postgres, …) store in the backend.
 fn storeOrWriteIfMissing(
     allocator: std.mem.Allocator,
     dir: []const u8,

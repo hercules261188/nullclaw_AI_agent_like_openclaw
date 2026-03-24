@@ -3186,7 +3186,7 @@ test "migrateLegacySessionKey reattaches session-scoped memory to canonical key"
 
     sm.migrateLegacySessionKey("agent:main:telegram:group:-100123:thread:77", "agent:main:telegram:group:-100123#topic:77");
 
-    const migrated = try mem.get(testing.allocator, "autosave_user_1");
+    const migrated = try mem.getScoped(testing.allocator, "autosave_user_1", "agent:main:telegram:group:-100123:thread:77");
     defer if (migrated) |entry| entry.deinit(testing.allocator);
     try testing.expect(migrated != null);
     try testing.expect(migrated.?.session_id != null);
@@ -3875,11 +3875,11 @@ test "processMessage /new clears autosave only for current session" {
     const response = try sm.processMessage("sess-a", "/new", null);
     defer testing.allocator.free(response);
 
-    const a_entry = try mem.get(testing.allocator, "autosave_user_a");
+    const a_entry = try mem.getScoped(testing.allocator, "autosave_user_a", "sess-a");
     defer if (a_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(a_entry == null);
 
-    const b_entry = try mem.get(testing.allocator, "autosave_user_b");
+    const b_entry = try mem.getScoped(testing.allocator, "autosave_user_b", "sess-b");
     defer if (b_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(b_entry != null);
     try testing.expectEqualStrings("session b", b_entry.?.content);
@@ -3913,11 +3913,11 @@ test "processMessage /new with model clears autosave only for current session" {
     const response = try sm.processMessage("sess-a", "/new gpt-4o-mini", null);
     defer testing.allocator.free(response);
 
-    const a_entry = try mem.get(testing.allocator, "autosave_user_a");
+    const a_entry = try mem.getScoped(testing.allocator, "autosave_user_a", "sess-a");
     defer if (a_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(a_entry == null);
 
-    const b_entry = try mem.get(testing.allocator, "autosave_user_b");
+    const b_entry = try mem.getScoped(testing.allocator, "autosave_user_b", "sess-b");
     defer if (b_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(b_entry != null);
     try testing.expectEqualStrings("session b", b_entry.?.content);
@@ -3951,11 +3951,11 @@ test "processMessage /reset clears autosave only for current session" {
     const response = try sm.processMessage("sess-a", "/reset", null);
     defer testing.allocator.free(response);
 
-    const a_entry = try mem.get(testing.allocator, "autosave_user_a");
+    const a_entry = try mem.getScoped(testing.allocator, "autosave_user_a", "sess-a");
     defer if (a_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(a_entry == null);
 
-    const b_entry = try mem.get(testing.allocator, "autosave_user_b");
+    const b_entry = try mem.getScoped(testing.allocator, "autosave_user_b", "sess-b");
     defer if (b_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(b_entry != null);
     try testing.expectEqualStrings("session b", b_entry.?.content);
@@ -3989,11 +3989,11 @@ test "processMessage /restart clears autosave only for current session" {
     const response = try sm.processMessage("sess-a", "/restart", null);
     defer testing.allocator.free(response);
 
-    const a_entry = try mem.get(testing.allocator, "autosave_user_a");
+    const a_entry = try mem.getScoped(testing.allocator, "autosave_user_a", "sess-a");
     defer if (a_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(a_entry == null);
 
-    const b_entry = try mem.get(testing.allocator, "autosave_user_b");
+    const b_entry = try mem.getScoped(testing.allocator, "autosave_user_b", "sess-b");
     defer if (b_entry) |entry| entry.deinit(testing.allocator);
     try testing.expect(b_entry != null);
     try testing.expectEqualStrings("session b", b_entry.?.content);

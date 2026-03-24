@@ -1270,19 +1270,6 @@ pub const SqliteMemory = struct {
         if (rc == c.SQLITE_ROW) {
             return try readEntryFromRow(stmt.?, allocator);
         }
-
-        const fallback_sql = "SELECT id, key, content, category, created_at, session_id FROM memories WHERE key = ?1 ORDER BY updated_at DESC LIMIT 1";
-        var fallback_stmt: ?*c.sqlite3_stmt = null;
-        rc = c.sqlite3_prepare_v2(self_.db, fallback_sql, -1, &fallback_stmt, null);
-        if (rc != c.SQLITE_OK) return error.PrepareFailed;
-        defer _ = c.sqlite3_finalize(fallback_stmt);
-
-        _ = c.sqlite3_bind_text(fallback_stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
-
-        rc = c.sqlite3_step(fallback_stmt);
-        if (rc == c.SQLITE_ROW) {
-            return try readEntryFromRow(fallback_stmt.?, allocator);
-        }
         return null;
     }
 
@@ -1370,9 +1357,7 @@ pub const SqliteMemory = struct {
 
     fn implForget(ptr: *anyopaque, key: []const u8) anyerror!bool {
         const self_: *Self = @ptrCast(@alignCast(ptr));
-        const existing = try implGet(ptr, self_.allocator, key);
-        if (existing == null) return false;
-        existing.?.deinit(self_.allocator);
+        if (!(try self_.keyExistsAnyScope(key))) return false;
         try self_.emitLocalEvent(.delete_all, key, null, null, null);
         return true;
     }
@@ -1705,20 +1690,24 @@ pub const SqliteMemory = struct {
     }
 
     fn applyCheckpointPayload(self: *Self, payload: []const u8) !void {
-        var owns_tx = c.sqlite3_get_autocommit(self.db) != 0;
-        if (owns_tx) owns_tx = try self.beginImmediate();
-        var committed = false;
-        errdefer if (owns_tx and !committed) self.rollbackTxn();
-
-        try self.execSql("checkpoint import", "DELETE FROM memory_events;");
-        try self.execSql("checkpoint import", "DELETE FROM memory_tombstones;");
-        try self.execSql("checkpoint import", "DELETE FROM memory_event_frontiers;");
-        try self.execSql("checkpoint import", "DELETE FROM memories;");
-        try self.execSql("checkpoint import", "DELETE FROM memory_feed_meta;");
-
         var last_sequence: u64 = 0;
         var compacted_through: u64 = 0;
         var saw_meta = false;
+        var frontiers: std.ArrayListUnmanaged(CheckpointFrontierRow) = .empty;
+        defer {
+            for (frontiers.items) |*row| row.deinit(self.allocator);
+            frontiers.deinit(self.allocator);
+        }
+        var states: std.ArrayListUnmanaged(CheckpointStateRow) = .empty;
+        defer {
+            for (states.items) |*row| row.deinit(self.allocator);
+            states.deinit(self.allocator);
+        }
+        var tombstones: std.ArrayListUnmanaged(CheckpointTombstoneRow) = .empty;
+        defer {
+            for (tombstones.items) |*row| row.deinit(self.allocator);
+            tombstones.deinit(self.allocator);
+        }
 
         var lines = std.mem.splitScalar(u8, payload, '\n');
         while (lines.next()) |raw_line| {
@@ -1731,6 +1720,8 @@ pub const SqliteMemory = struct {
             const kind = checkpointJsonStringField(parsed.value, "kind") orelse return error.InvalidEvent;
             if (std.mem.eql(u8, kind, "meta")) {
                 saw_meta = true;
+                const schema_version = checkpointJsonUnsignedField(parsed.value, "schema_version") orelse return error.InvalidEvent;
+                if (schema_version != 1) return error.InvalidEvent;
                 last_sequence = checkpointJsonUnsignedField(parsed.value, "last_sequence") orelse 0;
                 compacted_through = checkpointJsonUnsignedField(parsed.value, "compacted_through_sequence") orelse last_sequence;
                 continue;
@@ -1738,7 +1729,10 @@ pub const SqliteMemory = struct {
             if (std.mem.eql(u8, kind, "frontier")) {
                 const origin_instance_id = checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
                 const origin_sequence = checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
-                try self.insertCheckpointFrontier(origin_instance_id, origin_sequence);
+                try frontiers.append(self.allocator, .{
+                    .origin_instance_id = try self.allocator.dupe(u8, origin_instance_id),
+                    .origin_sequence = origin_sequence,
+                });
                 continue;
             }
             if (std.mem.eql(u8, kind, "state")) {
@@ -1749,16 +1743,23 @@ pub const SqliteMemory = struct {
                 const timestamp_ms = checkpointJsonIntegerField(parsed.value, "timestamp_ms") orelse return error.InvalidEvent;
                 const origin_instance_id = checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
                 const origin_sequence = checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
-                try self.insertCheckpointState(
-                    key,
-                    checkpointJsonNullableStringField(parsed.value, "session_id"),
-                    category,
-                    value_kind,
-                    content,
-                    timestamp_ms,
-                    origin_instance_id,
-                    origin_sequence,
-                );
+                if (value_kind) |kind_text| _ = MemoryValueKind.fromString(kind_text) orelse return error.InvalidEvent;
+                try states.append(self.allocator, .{
+                    .key = try self.allocator.dupe(u8, key),
+                    .session_id = if (checkpointJsonNullableStringField(parsed.value, "session_id")) |sid|
+                        try self.allocator.dupe(u8, sid)
+                    else
+                        null,
+                    .category = try self.allocator.dupe(u8, category),
+                    .value_kind = if (value_kind) |kind_text|
+                        try self.allocator.dupe(u8, kind_text)
+                    else
+                        null,
+                    .content = try self.allocator.dupe(u8, content),
+                    .timestamp_ms = timestamp_ms,
+                    .origin_instance_id = try self.allocator.dupe(u8, origin_instance_id),
+                    .origin_sequence = origin_sequence,
+                });
                 continue;
             }
             if (std.mem.eql(u8, kind, "scoped_tombstone") or std.mem.eql(u8, kind, "key_tombstone")) {
@@ -1766,16 +1767,69 @@ pub const SqliteMemory = struct {
                 const timestamp_ms = checkpointJsonIntegerField(parsed.value, "timestamp_ms") orelse return error.InvalidEvent;
                 const origin_instance_id = checkpointJsonStringField(parsed.value, "origin_instance_id") orelse return error.InvalidEvent;
                 const origin_sequence = checkpointJsonUnsignedField(parsed.value, "origin_sequence") orelse return error.InvalidEvent;
-                try self.insertCheckpointTombstone(kind, key, timestamp_ms, origin_instance_id, origin_sequence);
+                try tombstones.append(self.allocator, .{
+                    .kind = if (std.mem.eql(u8, kind, "key_tombstone")) "key_tombstone" else "scoped_tombstone",
+                    .key = try self.allocator.dupe(u8, key),
+                    .timestamp_ms = timestamp_ms,
+                    .origin_instance_id = try self.allocator.dupe(u8, origin_instance_id),
+                    .origin_sequence = origin_sequence,
+                });
                 continue;
             }
             return error.InvalidEvent;
         }
 
         if (!saw_meta) return error.InvalidEvent;
+
+        var owns_tx = c.sqlite3_get_autocommit(self.db) != 0;
+        if (owns_tx) owns_tx = try self.beginImmediate();
+        var committed = false;
+        errdefer if (owns_tx and !committed) self.rollbackTxn();
+
+        try self.execSql("checkpoint import", "DELETE FROM memory_events;");
+        try self.execSql("checkpoint import", "DELETE FROM memory_tombstones;");
+        try self.execSql("checkpoint import", "DELETE FROM memory_event_frontiers;");
+        try self.execSql("checkpoint import", "DELETE FROM memories;");
+        try self.execSql("checkpoint import", "DELETE FROM memory_feed_meta;");
+
+        for (frontiers.items) |row| {
+            try self.insertCheckpointFrontier(row.origin_instance_id, row.origin_sequence);
+        }
+        for (states.items) |row| {
+            try self.insertCheckpointState(
+                row.key,
+                row.session_id,
+                row.category,
+                row.value_kind,
+                row.content,
+                row.timestamp_ms,
+                row.origin_instance_id,
+                row.origin_sequence,
+            );
+        }
+        for (tombstones.items) |row| {
+            try self.insertCheckpointTombstone(
+                row.kind,
+                row.key,
+                row.timestamp_ms,
+                row.origin_instance_id,
+                row.origin_sequence,
+            );
+        }
         try self.setCompactedThroughSequenceTx(compacted_through);
         if (owns_tx) try self.commitTxn();
         committed = true;
+    }
+
+    fn keyExistsAnyScope(self: *Self, key: []const u8) !bool {
+        const sql = "SELECT 1 FROM memories WHERE key = ?1 LIMIT 1";
+        var stmt: ?*c.sqlite3_stmt = null;
+        var rc = c.sqlite3_prepare_v2(self.db, sql, -1, &stmt, null);
+        if (rc != c.SQLITE_OK) return error.PrepareFailed;
+        defer _ = c.sqlite3_finalize(stmt);
+        _ = c.sqlite3_bind_text(stmt, 1, key.ptr, @intCast(key.len), SQLITE_STATIC);
+        rc = c.sqlite3_step(stmt);
+        return rc == c.SQLITE_ROW;
     }
 
     fn insertCheckpointFrontier(self: *Self, origin_instance_id: []const u8, origin_sequence: u64) !void {
@@ -3263,19 +3317,20 @@ test "sqlite kv table exists" {
 
 // ── Session ID tests ──────────────────────────────────────────────
 
-test "sqlite store with session_id persists" {
+test "sqlite store with session_id persists in scoped namespace" {
     var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
     defer mem.deinit();
     const m = mem.memory();
 
     try m.store("k1", "session data", .core, "sess-abc");
 
-    const entry = (try m.get(std.testing.allocator, "k1")).?;
+    const entry = (try m.getScoped(std.testing.allocator, "k1", "sess-abc")).?;
     defer entry.deinit(std.testing.allocator);
 
     try std.testing.expectEqualStrings("session data", entry.content);
     try std.testing.expect(entry.session_id != null);
     try std.testing.expectEqualStrings("sess-abc", entry.session_id.?);
+    try std.testing.expect(try m.get(std.testing.allocator, "k1") == null);
 }
 
 test "sqlite store without session_id gives null" {
@@ -3403,7 +3458,7 @@ test "sqlite schema migration is idempotent" {
     // Store with session_id should still work
     const m = mem.memory();
     try m.store("k1", "data", .core, "sess-x");
-    const entry = (try m.get(std.testing.allocator, "k1")).?;
+    const entry = (try m.getScoped(std.testing.allocator, "k1", "sess-x")).?;
     defer entry.deinit(std.testing.allocator);
     try std.testing.expectEqualStrings("sess-x", entry.session_id.?);
 }
@@ -3440,16 +3495,16 @@ test "sqlite clearAutoSaved scoped by session_id" {
 
     try mem.clearAutoSaved("sess-a");
 
-    const a_entry = try m.get(std.testing.allocator, "autosave_user_a");
+    const a_entry = try m.getScoped(std.testing.allocator, "autosave_user_a", "sess-a");
     defer if (a_entry) |entry| entry.deinit(std.testing.allocator);
     try std.testing.expect(a_entry == null);
 
-    const b_entry = try m.get(std.testing.allocator, "autosave_user_b");
+    const b_entry = try m.getScoped(std.testing.allocator, "autosave_user_b", "sess-b");
     defer if (b_entry) |entry| entry.deinit(std.testing.allocator);
     try std.testing.expect(b_entry != null);
     try std.testing.expectEqualStrings("b", b_entry.?.content);
 
-    const normal = try m.get(std.testing.allocator, "normal_key");
+    const normal = try m.getScoped(std.testing.allocator, "normal_key", "sess-b");
     defer if (normal) |entry| entry.deinit(std.testing.allocator);
     try std.testing.expect(normal != null);
     try std.testing.expectEqualStrings("keep this", normal.?.content);
@@ -3580,7 +3635,7 @@ test "sqlite sessionStore clearAutoSaved" {
     try store.clearAutoSaved("s1");
 
     // autosave entry should be gone
-    const entry = try m.get(allocator, "autosave_user_1");
+    const entry = try m.getScoped(allocator, "autosave_user_1", "s1");
     try std.testing.expect(entry == null);
 
     // normal entry should remain
@@ -3713,12 +3768,30 @@ test "sqlite same key can exist in global and scoped namespaces" {
     defer global_entry.deinit(std.testing.allocator);
     try std.testing.expect(global_entry.session_id == null);
     try std.testing.expectEqualStrings("v", global_entry.content);
+    const unscoped_get = (try m.get(std.testing.allocator, "k")).?;
+    defer unscoped_get.deinit(std.testing.allocator);
+    try std.testing.expect(unscoped_get.session_id == null);
+    try std.testing.expectEqualStrings("v", unscoped_get.content);
 
     const scoped_entry = (try m.getScoped(std.testing.allocator, "k", "sess-new")).?;
     defer scoped_entry.deinit(std.testing.allocator);
     try std.testing.expect(scoped_entry.session_id != null);
     try std.testing.expectEqualStrings("sess-new", scoped_entry.session_id.?);
     try std.testing.expectEqualStrings("v2", scoped_entry.content);
+}
+
+test "sqlite get does not fall back to scoped namespace" {
+    var mem = try SqliteMemory.init(std.testing.allocator, ":memory:");
+    defer mem.deinit();
+    const m = mem.memory();
+
+    try m.store("scoped-only", "scoped value", .core, "sess-a");
+
+    try std.testing.expect(try m.get(std.testing.allocator, "scoped-only") == null);
+
+    const scoped_entry = (try m.getScoped(std.testing.allocator, "scoped-only", "sess-a")).?;
+    defer scoped_entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("scoped value", scoped_entry.content);
 }
 
 test "sqlite scoped forget removes only matching namespace" {
@@ -4027,6 +4100,26 @@ test "sqlite checkpoint restores replica and preserves local origin frontier" {
     defer root.freeEvents(std.testing.allocator, tail);
     try std.testing.expectEqual(@as(usize, 1), tail.len);
     try std.testing.expectEqual(@as(u64, 2), tail[0].origin_sequence);
+}
+
+test "sqlite checkpoint rejects unsupported schema without clearing state" {
+    var mem = try SqliteMemory.initWithInstanceId(std.testing.allocator, ":memory:", "agent-a");
+    defer mem.deinit();
+    const memory = mem.memory();
+
+    try memory.store("preferences.theme", "dark", .core, null);
+
+    const bad_checkpoint =
+        \\{"kind":"meta","schema_version":2,"last_sequence":1,"last_timestamp_ms":1,"compacted_through_sequence":1}
+        \\{"kind":"state","key":"preferences.theme","session_id":null,"category":"core","value_kind":null,"content":"light","timestamp_ms":1,"origin_instance_id":"agent-a","origin_sequence":1}
+        \\
+    ;
+
+    try std.testing.expectError(error.InvalidEvent, memory.applyCheckpoint(bad_checkpoint));
+
+    const entry = (try memory.getScoped(std.testing.allocator, "preferences.theme", null)).?;
+    defer entry.deinit(std.testing.allocator);
+    try std.testing.expectEqualStrings("dark", entry.content);
 }
 
 test "sqlite tombstones block older cross-origin put replay" {

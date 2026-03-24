@@ -51,21 +51,19 @@ pub fn createProvider(
 }
 
 test "backendUsesFiles" {
-    try std.testing.expect(backendUsesFiles("hybrid"));
     try std.testing.expect(backendUsesFiles("markdown"));
+    try std.testing.expect(!backendUsesFiles("hybrid"));
     try std.testing.expect(!backendUsesFiles("sqlite"));
     try std.testing.expect(!backendUsesFiles("postgres"));
     try std.testing.expect(!backendUsesFiles("redis"));
     try std.testing.expect(!backendUsesFiles("none"));
 }
 
-test "createProvider returns FileBootstrapProvider for hybrid" {
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
-    defer std.testing.allocator.free(dir);
+test "createProvider returns MemoryBootstrapProvider for hybrid" {
+    var mem = memory_root.InMemoryLruMemory.init(std.testing.allocator, 100);
+    defer mem.deinit();
 
-    const bp = try createProvider(std.testing.allocator, "hybrid", null, dir);
+    const bp = try createProvider(std.testing.allocator, "hybrid", mem.memory(), null);
     defer bp.deinit();
 
     try bp.store("SOUL.md", "test");
@@ -82,9 +80,9 @@ test "createProvider returns NullBootstrapProvider for none" {
     try std.testing.expect(content == null);
 }
 
-test "createProvider errors without workspace for hybrid" {
+test "createProvider errors without memory for hybrid" {
     const result = createProvider(std.testing.allocator, "hybrid", null, null);
-    try std.testing.expectError(error.WorkspaceDirRequired, result);
+    try std.testing.expectError(error.MemoryRequired, result);
 }
 
 test "createProvider errors without memory for sqlite" {

@@ -8,13 +8,11 @@ const InMemoryLruMemory = memory_root.InMemoryLruMemory;
 
 const testing = std.testing;
 
-test "factory creates working FileBootstrapProvider for hybrid backend" {
-    var tmp = testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try tmp.dir.realpathAlloc(testing.allocator, ".");
-    defer testing.allocator.free(dir_path);
+test "factory creates working MemoryBootstrapProvider for hybrid backend" {
+    var lru = InMemoryLruMemory.init(testing.allocator, 100);
+    defer lru.deinit();
 
-    const bp = try bootstrap_root.createProvider(testing.allocator, "hybrid", null, dir_path);
+    const bp = try bootstrap_root.createProvider(testing.allocator, "hybrid", lru.memory(), null);
     defer bp.deinit();
 
     try bp.store("SOUL.md", "# Test Soul");
@@ -22,11 +20,7 @@ test "factory creates working FileBootstrapProvider for hybrid backend" {
     defer if (loaded) |c| testing.allocator.free(c);
     try testing.expectEqualStrings("# Test Soul", loaded.?);
 
-    // Verify file actually exists on disk.
-    const file_path = try std.fs.path.join(testing.allocator, &.{ dir_path, "SOUL.md" });
-    defer testing.allocator.free(file_path);
-    const f = try std.fs.openFileAbsolute(file_path, .{});
-    f.close();
+    try testing.expect(bp.exists("SOUL.md"));
 }
 
 test "factory creates working MemoryBootstrapProvider for sqlite backend" {

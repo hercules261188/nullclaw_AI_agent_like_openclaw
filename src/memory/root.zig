@@ -824,11 +824,11 @@ pub fn promptBootstrapMemoryKey(filename: []const u8) ?[]const u8 {
     return null;
 }
 
-/// markdown and hybrid backends keep bootstrap identity in workspace files;
-/// all other backends use backend-native key/value entries.
+/// Only the markdown backend keeps bootstrap identity in workspace files.
+/// All other backends use backend-native key/value entries.
 pub fn usesWorkspaceBootstrapFiles(memory_backend: ?[]const u8) bool {
     const backend = memory_backend orelse return true;
-    return std.mem.eql(u8, backend, "markdown") or std.mem.eql(u8, backend, "hybrid");
+    return std.mem.eql(u8, backend, "markdown");
 }
 
 pub fn isInternalMemoryKey(key: []const u8) bool {
@@ -2287,6 +2287,28 @@ test "initRuntime sqlite returns full runtime" {
     try std.testing.expect(rt.capabilities.supports_session_store);
     try std.testing.expect(rt.capabilities.supports_keyword_rank);
     try std.testing.expect(rt.capabilities.supports_transactions);
+    try std.testing.expect(rt._db_path != null);
+    const path_slice = std.mem.span(rt._db_path.?);
+    try std.testing.expect(std.mem.endsWith(u8, path_slice, "memory.db"));
+}
+
+test "initRuntime hybrid returns sqlite-backed runtime and session store" {
+    if (!build_options.enable_memory_sqlite) return;
+    var ws = try TestWorkspace.init(std.testing.allocator);
+    defer ws.deinit(std.testing.allocator);
+
+    var rt = initRuntime(std.testing.allocator, &.{ .backend = "hybrid" }, ws.path) orelse
+        return error.TestUnexpectedResult;
+    defer rt.deinit();
+
+    try std.testing.expectEqualStrings("sqlite", rt.memory.name());
+    try std.testing.expect(rt.session_store != null);
+    try std.testing.expect(rt.capabilities.supports_session_store);
+    try std.testing.expect(rt.capabilities.supports_keyword_rank);
+    try std.testing.expect(rt.capabilities.supports_transactions);
+    try std.testing.expectEqualStrings("hybrid", rt.resolved.primary_backend);
+    try std.testing.expectEqualStrings("keyword", rt.resolved.retrieval_mode);
+    try std.testing.expectEqualStrings("none", rt.resolved.vector_mode);
     try std.testing.expect(rt._db_path != null);
     const path_slice = std.mem.span(rt._db_path.?);
     try std.testing.expect(std.mem.endsWith(u8, path_slice, "memory.db"));
