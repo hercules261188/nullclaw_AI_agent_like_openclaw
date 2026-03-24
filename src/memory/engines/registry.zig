@@ -77,7 +77,7 @@ const markdown_backend = BackendDescriptor{
 
 const lucid_backend = BackendDescriptor{
     .name = "lucid",
-    .label = "Lucid — SQLite + cross-project memory sync via lucid CLI",
+    .label = "Lucid — SQLite + best-effort export via lucid CLI",
     .auto_save_default = true,
     .capabilities = .{ .supports_keyword_rank = true, .supports_session_store = true, .supports_transactions = true, .supports_outbox = true },
     .needs_db_path = true,

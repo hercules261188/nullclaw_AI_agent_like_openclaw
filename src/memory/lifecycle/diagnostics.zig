@@ -57,7 +57,7 @@ pub fn diagnose(rt: *root.MemoryRuntime) DiagnosticReport {
     const entry_count: usize = rt.memory.count() catch 0;
 
     // Vector plane
-    const vector_store_active = rt._vector_store != null;
+    const vector_store_active = rt._vector_store != null or !std.mem.eql(u8, rt.resolved.vector_mode, "none");
     const vector_entry_count: ?usize = if (rt._vector_store) |vs| blk: {
         break :blk vs.count() catch null;
     } else null;
@@ -349,7 +349,6 @@ test "diagnose with vector store" {
 
     const allocator = testing.allocator;
     const sqlite_impl = try allocator.create(root.SqliteMemory);
-    errdefer allocator.destroy(sqlite_impl);
     sqlite_impl.* = try root.SqliteMemory.init(allocator, ":memory:");
     sqlite_impl.owns_self = true;
 
@@ -387,12 +386,25 @@ test "diagnose with vector store" {
     try testing.expectEqual(@as(usize, 1), report.vector_entry_count.?);
 }
 
+test "diagnose marks native lancedb vector backend active" {
+    const allocator = testing.allocator;
+    var setup = try makeTestRuntime(allocator);
+    defer setup.rt.deinit();
+
+    setup.rt.resolved.vector_mode = "native_lancedb";
+    setup.rt.resolved.vector_sync_mode = "backend_native";
+
+    const report = diagnose(&setup.rt);
+
+    try testing.expect(report.vector_store_active);
+    try testing.expect(report.vector_entry_count == null);
+}
+
 test "diagnose with outbox" {
     if (!build_options.enable_sqlite) return error.SkipZigTest;
 
     const allocator = testing.allocator;
     const sqlite_impl = try allocator.create(root.SqliteMemory);
-    errdefer allocator.destroy(sqlite_impl);
     sqlite_impl.* = try root.SqliteMemory.init(allocator, ":memory:");
     sqlite_impl.owns_self = true;
 

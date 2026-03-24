@@ -1029,10 +1029,10 @@ pub const Memory = struct {
 pub const ResolvedConfig = struct {
     primary_backend: []const u8,
     retrieval_mode: []const u8, // "disabled" | "keyword" | "hybrid"
-    vector_mode: []const u8, // "none" | "sqlite_shared" | "sqlite_sidecar" | "sqlite_ann" | "qdrant" | "pgvector"
+    vector_mode: []const u8, // "none" | "sqlite_shared" | "sqlite_sidecar" | "sqlite_ann" | "qdrant" | "pgvector" | "native_lancedb"
     embedding_provider: []const u8, // "none" | "openai" | "gemini" | "voyage" | "ollama" | "auto"
     rollout_mode: []const u8,
-    vector_sync_mode: []const u8, // "best_effort" | "durable_outbox"
+    vector_sync_mode: []const u8, // "best_effort" | "durable_outbox" | "backend_native"
     hygiene_enabled: bool,
     snapshot_enabled: bool,
     cache_enabled: bool,
@@ -1498,8 +1498,18 @@ pub fn initRuntime(
     var sidecar_db_path: ?[*:0]const u8 = null;
     var resolved_vector_mode: []const u8 = "none";
     var resolved_vector_sync_mode: []const u8 = "best_effort";
+    var native_vector_backend_active = false;
     if (config.search.enabled and !std.mem.eql(u8, config.search.provider, "none") and config.search.query.hybrid.enabled) vec_plane: {
         const active_embed_provider = embed_provider orelse break :vec_plane;
+
+        if (std.mem.eql(u8, config.backend, "lancedb")) {
+            // LanceDB owns its vector index internally. Do not build a second
+            // runtime vector plane or sidecar/outbox on top of it.
+            native_vector_backend_active = true;
+            resolved_vector_mode = "native_lancedb";
+            resolved_vector_sync_mode = "backend_native";
+            break :vec_plane;
+        }
 
         // 2. Resolve vector store mode based on config.search.store.kind
         //    "auto"           → sqlite_shared if primary is sqlite-based, else sqlite_sidecar
@@ -1696,8 +1706,8 @@ pub fn initRuntime(
             !std.mem.eql(u8, config.search.provider, "none") and
             config.search.query.hybrid.enabled;
         const durable_requested = !std.mem.eql(u8, config.search.sync.mode, "best_effort");
-        const vector_plane_failed = vector_expected and vs_iface == null;
-        const durable_outbox_unavailable = vector_expected and durable_requested and outbox_inst == null;
+        const vector_plane_failed = vector_expected and !native_vector_backend_active and vs_iface == null;
+        const durable_outbox_unavailable = vector_expected and durable_requested and !native_vector_backend_active and outbox_inst == null;
         if (vector_plane_failed or durable_outbox_unavailable) {
             if (vector_plane_failed) {
                 log.warn("fallback_policy=fail_fast: vector plane init failed, aborting runtime creation", .{});
@@ -1773,7 +1783,7 @@ pub fn initRuntime(
     else
         "keyword";
     const source_count: usize = if (engine) |eng| eng.sources.items.len else 0;
-    const vector_mode: []const u8 = if (vs_iface == null) "none" else resolved_vector_mode;
+    const vector_mode: []const u8 = if (vs_iface == null and !native_vector_backend_active) "none" else resolved_vector_mode;
     const cache_enabled = resp_cache != null;
     log.info("memory plan resolved: backend={s} retrieval={s} vector={s} rollout={s} hygiene={} snapshot={} cache={} semantic_cache={} summarizer={} sources={d}", .{
         config.backend,
@@ -2458,6 +2468,10 @@ test "initRuntime lancedb backend receives embedding provider" {
 
     try std.testing.expect(rt._embedding_provider != null);
     try std.testing.expectEqualStrings("lancedb", rt.memory.name());
+    try std.testing.expect(rt._vector_store == null);
+    try std.testing.expect(rt._outbox == null);
+    try std.testing.expectEqualStrings("native_lancedb", rt.resolved.vector_mode);
+    try std.testing.expectEqualStrings("backend_native", rt.resolved.vector_sync_mode);
 
     const impl_: *LanceDbMemory = @ptrCast(@alignCast(rt.memory.ptr));
     try std.testing.expect(impl_.embedder != null);
