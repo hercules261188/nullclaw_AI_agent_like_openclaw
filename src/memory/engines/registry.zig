@@ -332,7 +332,7 @@ fn createSqlite(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstan
 fn createMarkdown(allocator: std.mem.Allocator, cfg: BackendConfig) !BackendInstance {
     const impl_ = try allocator.create(root.MarkdownMemory);
     errdefer allocator.destroy(impl_);
-    impl_.* = try root.MarkdownMemory.init(allocator, cfg.workspace_dir);
+    impl_.* = try root.MarkdownMemory.initWithInstanceId(allocator, cfg.workspace_dir, cfg.instance_id);
     impl_.owns_self = true;
     return .{ .memory = impl_.memory(), .session_store = null };
 }

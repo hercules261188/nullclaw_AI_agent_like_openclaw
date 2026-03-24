@@ -1664,7 +1664,7 @@ test "feed overlay does not auto-bootstrap backend state" {
     const workspace = try tmp.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(workspace);
 
-    var backend = try root.MarkdownMemory.init(std.testing.allocator, workspace);
+    var backend = try root.markdown.MarkdownProjectionMemory.init(std.testing.allocator, workspace);
     const memory = backend.memory();
     try memory.store("preferences.theme", "dark", .core, null);
     try memory.store("preferences.locale", "en", .core, "sess-a");
@@ -1692,8 +1692,8 @@ test "feed overlay converges markdown replicas" {
     const ws_b = try tmp_b.dir.realpathAlloc(std.testing.allocator, ".");
     defer std.testing.allocator.free(ws_b);
 
-    var source_backend = try root.MarkdownMemory.init(std.testing.allocator, ws_a);
-    var replica_backend = try root.MarkdownMemory.init(std.testing.allocator, ws_b);
+    var source_backend = try root.markdown.MarkdownProjectionMemory.init(std.testing.allocator, ws_a);
+    var replica_backend = try root.markdown.MarkdownProjectionMemory.init(std.testing.allocator, ws_b);
 
     var source = try EventFeedOverlay.init(std.testing.allocator, source_backend.memory(), ws_a, "markdown-source", "agent-a");
     defer source.deinit();
