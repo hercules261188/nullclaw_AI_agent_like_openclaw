@@ -73,6 +73,22 @@ pub fn buildQuery(allocator: std.mem.Allocator, template: []const u8, schema_q: 
     return buf.toOwnedSliceSentinel(allocator, 0);
 }
 
+fn allocPrintZCompat(allocator: std.mem.Allocator, comptime fmt: []const u8, args: anytype) ![:0]u8 {
+    const rendered = try std.fmt.allocPrint(allocator, fmt, args);
+    defer allocator.free(rendered);
+    return allocator.dupeZ(u8, rendered);
+}
+
+fn bytesToHexLower(bytes: []const u8, out: []u8) []const u8 {
+    std.debug.assert(out.len >= bytes.len * 2);
+    const alphabet = "0123456789abcdef";
+    for (bytes, 0..) |byte, idx| {
+        out[idx * 2] = alphabet[byte >> 4];
+        out[idx * 2 + 1] = alphabet[byte & 0x0f];
+    }
+    return out[0 .. bytes.len * 2];
+}
+
 fn getNowTimestamp(allocator: std.mem.Allocator) ![]u8 {
     const ts = std.time.timestamp();
     return std.fmt.allocPrint(allocator, "{d}", .{ts});
@@ -332,7 +348,11 @@ const PostgresMemoryImpl = struct {
     fn migrate(self: *Self, raw_schema: []const u8, raw_table: []const u8) !void {
         // raw_schema/raw_table are pre-validated (alphanumeric + underscore only) so safe where used below.
         // Index names must NOT use quoted identifiers, so we use raw_table directly.
-        const ddl = try std.fmt.allocPrintZ(self.allocator,
+        var ddl_buf: std.ArrayListUnmanaged(u8) = .empty;
+        defer ddl_buf.deinit(self.allocator);
+        const w = ddl_buf.writer(self.allocator);
+
+        try w.print(
             \\CREATE TABLE IF NOT EXISTS {s}.{s} (
             \\    id TEXT PRIMARY KEY,
             \\    key TEXT NOT NULL,
@@ -347,18 +367,21 @@ const PostgresMemoryImpl = struct {
             \\    created_at TEXT NOT NULL,
             \\    updated_at TEXT NOT NULL
             \\);
-            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';
-            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS value_kind TEXT;
-            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_timestamp_ms BIGINT NOT NULL DEFAULT 0;
-            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_origin_instance_id TEXT NOT NULL DEFAULT 'default';
-            \\ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_origin_sequence BIGINT NOT NULL DEFAULT 0;
-            \\DROP INDEX IF EXISTS {s}.idx_{s}_key;
-            \\DROP INDEX IF EXISTS {s}.idx_{s}_key_instance;
-            \\CREATE UNIQUE INDEX IF NOT EXISTS idx_{s}_key_instance_session ON {s}.{s}(key, instance_id, COALESCE(session_id, '__global__'));
-            \\CREATE INDEX IF NOT EXISTS idx_{s}_category ON {s}.{s}(category);
-            \\CREATE INDEX IF NOT EXISTS idx_{s}_session ON {s}.{s}(session_id);
-            \\CREATE INDEX IF NOT EXISTS idx_{s}_instance ON {s}.{s}(instance_id);
-            \\CREATE INDEX IF NOT EXISTS idx_{s}_event_order ON {s}.{s}(instance_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence);
+        , .{ self.schema_q, self.table_q });
+        try w.print("ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS instance_id TEXT NOT NULL DEFAULT 'default';\n", .{ self.schema_q, self.table_q });
+        try w.print("ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS value_kind TEXT;\n", .{ self.schema_q, self.table_q });
+        try w.print("ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_timestamp_ms BIGINT NOT NULL DEFAULT 0;\n", .{ self.schema_q, self.table_q });
+        try w.print("ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_origin_instance_id TEXT NOT NULL DEFAULT 'default';\n", .{ self.schema_q, self.table_q });
+        try w.print("ALTER TABLE {s}.{s} ADD COLUMN IF NOT EXISTS event_origin_sequence BIGINT NOT NULL DEFAULT 0;\n", .{ self.schema_q, self.table_q });
+        try w.print("DROP INDEX IF EXISTS {s}.idx_{s}_key;\n", .{ self.schema_q, raw_table });
+        try w.print("DROP INDEX IF EXISTS {s}.idx_{s}_key_instance;\n", .{ self.schema_q, raw_table });
+        try w.print("CREATE UNIQUE INDEX IF NOT EXISTS idx_{s}_key_instance_session ON {s}.{s}(key, instance_id, COALESCE(session_id, '__global__'));\n", .{ raw_table, self.schema_q, self.table_q });
+        try w.print("CREATE INDEX IF NOT EXISTS idx_{s}_category ON {s}.{s}(category);\n", .{ raw_table, self.schema_q, self.table_q });
+        try w.print("CREATE INDEX IF NOT EXISTS idx_{s}_session ON {s}.{s}(session_id);\n", .{ raw_table, self.schema_q, self.table_q });
+        try w.print("CREATE INDEX IF NOT EXISTS idx_{s}_instance ON {s}.{s}(instance_id);\n", .{ raw_table, self.schema_q, self.table_q });
+        try w.print("CREATE INDEX IF NOT EXISTS idx_{s}_event_order ON {s}.{s}(instance_id, event_timestamp_ms, event_origin_instance_id, event_origin_sequence);\n", .{ raw_table, self.schema_q, self.table_q });
+
+        try w.print(
             \\CREATE TABLE IF NOT EXISTS {s}.memory_events (
             \\    instance_id TEXT NOT NULL DEFAULT 'default',
             \\    local_sequence BIGINT NOT NULL,
@@ -399,6 +422,16 @@ const PostgresMemoryImpl = struct {
             \\    value TEXT NOT NULL,
             \\    PRIMARY KEY(instance_id, key)
             \\);
+        , .{
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+            self.schema_q,
+        });
+
+        try w.print(
             \\CREATE TABLE IF NOT EXISTS {s}.messages (
             \\    id SERIAL PRIMARY KEY,
             \\    session_id TEXT NOT NULL,
@@ -434,46 +467,17 @@ const PostgresMemoryImpl = struct {
             \\CREATE INDEX IF NOT EXISTS idx_session_usage_instance ON {s}.session_usage(instance_id);
         , .{
             self.schema_q,
-            self.table_q,
-            self.schema_q,
-            self.table_q,
-            self.schema_q,
-            self.table_q,
-            self.schema_q,
-            self.table_q,
-            self.schema_q,
-            self.table_q,
-            self.schema_q,
-            raw_table,
-            raw_table,
-            self.schema_q,
-            self.table_q,
-            raw_table,
-            self.schema_q,
-            self.table_q,
-            raw_table,
-            self.schema_q,
-            self.table_q,
-            raw_table,
-            raw_table,
-            self.schema_q,
-            self.table_q,
-            self.schema_q,
-            self.schema_q,
-            self.schema_q,
-            self.schema_q,
-            self.schema_q,
-            self.table_q,
-            self.schema_q,
-            self.schema_q,
             self.schema_q,
             self.schema_q,
             self.schema_q,
             self.schema_q,
             raw_schema,
+            raw_schema,
             self.schema_q,
             self.schema_q,
         });
+
+        const ddl = try self.allocator.dupeZ(u8, ddl_buf.items);
         defer self.allocator.free(ddl);
 
         const result = c.PQexec(self.conn, ddl.ptr);
@@ -648,11 +652,11 @@ const PostgresMemoryImpl = struct {
     }
 
     fn schemaQuery(self: *Self, allocator: std.mem.Allocator, comptime fmt: []const u8) ![:0]u8 {
-        return std.fmt.allocPrintZ(allocator, fmt, .{self.schema_q});
+        return allocPrintZCompat(allocator, fmt, .{self.schema_q});
     }
 
     fn schemaTableQuery(self: *Self, allocator: std.mem.Allocator, comptime fmt: []const u8) ![:0]u8 {
-        return std.fmt.allocPrintZ(allocator, fmt, .{ self.schema_q, self.table_q });
+        return allocPrintZCompat(allocator, fmt, .{ self.schema_q, self.table_q });
     }
 
     fn getMetaValueTx(self: *Self, allocator: std.mem.Allocator, key: []const u8) !?[]u8 {
@@ -686,7 +690,7 @@ const PostgresMemoryImpl = struct {
         defer allocator.free(iid_z);
         const key_z = try allocator.dupeZ(u8, key);
         defer allocator.free(key_z);
-        const value_str = try std.fmt.allocPrintZ(allocator, "{d}", .{value});
+        const value_str = try allocPrintZCompat(allocator, "{d}", .{value});
         defer allocator.free(value_str);
 
         const params = [_]?[*:0]const u8{ iid_z, key_z, value_str };
@@ -748,7 +752,7 @@ const PostgresMemoryImpl = struct {
         defer allocator.free(iid_z);
         const origin_z = try allocator.dupeZ(u8, origin_instance_id);
         defer allocator.free(origin_z);
-        const seq_z = try std.fmt.allocPrintZ(allocator, "{d}", .{origin_sequence});
+        const seq_z = try allocPrintZCompat(allocator, "{d}", .{origin_sequence});
         defer allocator.free(seq_z);
 
         const params = [_]?[*:0]const u8{ iid_z, origin_z, seq_z };
@@ -902,25 +906,25 @@ const PostgresMemoryImpl = struct {
 
         const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
         defer self.allocator.free(iid_z);
-        const seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{next_event_sequence});
+        const seq_z = try allocPrintZCompat(self.allocator, "{d}", .{next_event_sequence});
         defer self.allocator.free(seq_z);
         const origin_z = try self.allocator.dupeZ(u8, input.origin_instance_id);
         defer self.allocator.free(origin_z);
-        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.origin_sequence});
+        const origin_seq_z = try allocPrintZCompat(self.allocator, "{d}", .{input.origin_sequence});
         defer self.allocator.free(origin_seq_z);
-        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.timestamp_ms});
+        const timestamp_z = try allocPrintZCompat(self.allocator, "{d}", .{input.timestamp_ms});
         defer self.allocator.free(timestamp_z);
         const op_z = try self.allocator.dupeZ(u8, input.operation.toString());
         defer self.allocator.free(op_z);
         const key_z = try self.allocator.dupeZ(u8, input.key);
         defer self.allocator.free(key_z);
-        const sid_z: ?[*:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        const sid_z: ?[:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |sid| self.allocator.free(sid);
-        const cat_z: ?[*:0]u8 = if (category_str) |cat| try self.allocator.dupeZ(u8, cat) else null;
+        const cat_z: ?[:0]u8 = if (category_str) |cat| try self.allocator.dupeZ(u8, cat) else null;
         defer if (cat_z) |cat| self.allocator.free(cat);
-        const kind_z: ?[*:0]u8 = if (value_kind_str) |kind| try self.allocator.dupeZ(u8, kind) else null;
+        const kind_z: ?[:0]u8 = if (value_kind_str) |kind| try self.allocator.dupeZ(u8, kind) else null;
         defer if (kind_z) |kind| self.allocator.free(kind);
-        const content_z: ?[*:0]u8 = if (input.content) |content| try self.allocator.dupeZ(u8, content) else null;
+        const content_z: ?[:0]u8 = if (input.content) |content| try self.allocator.dupeZ(u8, content) else null;
         defer if (content_z) |content| self.allocator.free(content);
 
         const params = [_]?[*:0]const u8{
@@ -931,10 +935,10 @@ const PostgresMemoryImpl = struct {
             timestamp_z,
             op_z,
             key_z,
-            sid_z,
-            cat_z,
-            kind_z,
-            content_z,
+            if (sid_z) |sid| sid.ptr else null,
+            if (cat_z) |cat| cat.ptr else null,
+            if (kind_z) |kind| kind.ptr else null,
+            if (content_z) |content| content.ptr else null,
         };
         const lengths = [_]c_int{
             @intCast(self.localInstanceId().len),
@@ -1006,10 +1010,10 @@ const PostgresMemoryImpl = struct {
         defer self.allocator.free(iid_z);
         const key_z = try self.allocator.dupeZ(u8, input.key);
         defer self.allocator.free(key_z);
-        const sid_z: ?[*:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        const sid_z: ?[:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |sid| self.allocator.free(sid);
 
-        const select_params = [_]?[*:0]const u8{ iid_z, key_z, sid_z };
+        const select_params = [_]?[*:0]const u8{ iid_z, key_z, if (sid_z) |sid| sid.ptr else null };
         const select_lengths = [_]c_int{
             @intCast(self.localInstanceId().len),
             @intCast(input.key.len),
@@ -1082,15 +1086,15 @@ const PostgresMemoryImpl = struct {
         const cat_z = try self.allocator.dupeZ(u8, cat_str);
         defer self.allocator.free(cat_z);
         const value_kind_str = if (resolved_state.value_kind) |kind| kind.toString() else null;
-        const kind_z: ?[*:0]u8 = if (value_kind_str) |kind| try self.allocator.dupeZ(u8, kind) else null;
+        const kind_z: ?[:0]u8 = if (value_kind_str) |kind| try self.allocator.dupeZ(u8, kind) else null;
         defer if (kind_z) |kind| self.allocator.free(kind);
-        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.timestamp_ms});
+        const timestamp_z = try allocPrintZCompat(self.allocator, "{d}", .{input.timestamp_ms});
         defer self.allocator.free(timestamp_z);
         const origin_z = try self.allocator.dupeZ(u8, input.origin_instance_id);
         defer self.allocator.free(origin_z);
-        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.origin_sequence});
+        const origin_seq_z = try allocPrintZCompat(self.allocator, "{d}", .{input.origin_sequence});
         defer self.allocator.free(origin_seq_z);
-        const now = try std.fmt.allocPrintZ(self.allocator, "{d}", .{@divTrunc(input.timestamp_ms, 1000)});
+        const now = try allocPrintZCompat(self.allocator, "{d}", .{@divTrunc(input.timestamp_ms, 1000)});
         defer self.allocator.free(now);
 
         const insert_params = [_]?[*:0]const u8{
@@ -1098,9 +1102,9 @@ const PostgresMemoryImpl = struct {
             key_z,
             content_z,
             cat_z,
-            sid_z,
+            if (sid_z) |sid| sid.ptr else null,
             iid_z,
-            kind_z,
+            if (kind_z) |kind| kind.ptr else null,
             timestamp_z,
             origin_z,
             origin_seq_z,
@@ -1136,10 +1140,10 @@ const PostgresMemoryImpl = struct {
         defer self.allocator.free(iid_z);
         const key_z = try self.allocator.dupeZ(u8, input.key);
         defer self.allocator.free(key_z);
-        const sid_z: ?[*:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        const sid_z: ?[:0]u8 = if (input.session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |sid| self.allocator.free(sid);
 
-        const params = [_]?[*:0]const u8{ iid_z, key_z, sid_z };
+        const params = [_]?[*:0]const u8{ iid_z, key_z, if (sid_z) |sid| sid.ptr else null };
         const lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(input.key.len), if (input.session_id) |sid| @intCast(sid.len) else 0 };
         const result = try self.execParams(select_sql, &params, &lengths);
         defer c.PQclear(result);
@@ -1210,9 +1214,9 @@ const PostgresMemoryImpl = struct {
         defer self.allocator.free(delete_sql);
 
         for (sessions_to_delete.items) |sid_opt| {
-            const sid_z: ?[*:0]u8 = if (sid_opt) |sid| try self.allocator.dupeZ(u8, sid) else null;
+            const sid_z: ?[:0]u8 = if (sid_opt) |sid| try self.allocator.dupeZ(u8, sid) else null;
             defer if (sid_z) |sid| self.allocator.free(sid);
-            const delete_params = [_]?[*:0]const u8{ iid_z, key_z, sid_z };
+            const delete_params = [_]?[*:0]const u8{ iid_z, key_z, if (sid_z) |sid| sid.ptr else null };
             const delete_lengths = [_]c_int{ @intCast(self.localInstanceId().len), @intCast(input.key.len), if (sid_opt) |sid| @intCast(sid.len) else 0 };
             const delete_result = try self.execParams(delete_sql, &delete_params, &delete_lengths);
             c.PQclear(delete_result);
@@ -1260,13 +1264,13 @@ const PostgresMemoryImpl = struct {
         );
         defer self.allocator.free(upsert_sql);
 
-        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        const sid_z: ?[:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |sid| self.allocator.free(sid);
-        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.timestamp_ms});
+        const timestamp_z = try allocPrintZCompat(self.allocator, "{d}", .{input.timestamp_ms});
         defer self.allocator.free(timestamp_z);
         const origin_z = try self.allocator.dupeZ(u8, input.origin_instance_id);
         defer self.allocator.free(origin_z);
-        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{input.origin_sequence});
+        const origin_seq_z = try allocPrintZCompat(self.allocator, "{d}", .{input.origin_sequence});
         defer self.allocator.free(origin_seq_z);
 
         const upsert_params = [_]?[*:0]const u8{
@@ -1274,7 +1278,7 @@ const PostgresMemoryImpl = struct {
             key_z,
             scope_z,
             session_key_z,
-            sid_z,
+            if (sid_z) |sid| sid.ptr else null,
             timestamp_z,
             origin_z,
             origin_seq_z,
@@ -1366,7 +1370,7 @@ const PostgresMemoryImpl = struct {
         if (trimmed.len == 0) return allocator.alloc(MemoryEntry, 0);
 
         // Build ILIKE pattern: %query%
-        const pattern = try std.fmt.allocPrintZ(allocator, "%{s}%", .{trimmed});
+        const pattern = try allocPrintZCompat(allocator, "%{s}%", .{trimmed});
         defer allocator.free(pattern);
 
         var limit_buf: [20]u8 = undefined;
@@ -1380,11 +1384,11 @@ const PostgresMemoryImpl = struct {
             const sid_z = try allocator.dupeZ(u8, sid);
             defer allocator.free(sid_z);
             const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr, sid_z, iid_z };
-            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(sid.len), @intCast(local_instance_id.len) };
+            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(limit_str.len), @intCast(sid.len), @intCast(local_instance_id.len) };
             result = try self_.execParams(self_.q_recall_sid, &params, &lengths);
         } else {
             const params = [_]?[*:0]const u8{ pattern.ptr, limit_str.ptr, iid_z };
-            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(std.mem.len(limit_str)), @intCast(local_instance_id.len) };
+            const lengths = [_]c_int{ @intCast(pattern.len - 1), @intCast(limit_str.len), @intCast(local_instance_id.len) };
             result = try self_.execParams(self_.q_recall, &params, &lengths);
         }
         defer c.PQclear(result);
@@ -1436,12 +1440,12 @@ const PostgresMemoryImpl = struct {
 
         const key_z = try allocator.dupeZ(u8, key);
         defer allocator.free(key_z);
-        const sid_z: ?[*:0]u8 = if (session_id) |sid| try allocator.dupeZ(u8, sid) else null;
+        const sid_z: ?[:0]u8 = if (session_id) |sid| try allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |sid| allocator.free(sid);
         const iid_z = try allocator.dupeZ(u8, local_instance_id);
         defer allocator.free(iid_z);
 
-        const params = [_]?[*:0]const u8{ key_z, sid_z, iid_z };
+        const params = [_]?[*:0]const u8{ key_z, if (sid_z) |sid| sid.ptr else null, iid_z };
         const lengths = [_]c_int{
             @intCast(key.len),
             if (session_id) |sid| @intCast(sid.len) else 0,
@@ -1538,9 +1542,9 @@ const PostgresMemoryImpl = struct {
 
         const iid_z = try allocator.dupeZ(u8, self_.localInstanceId());
         defer allocator.free(iid_z);
-        const after_z = try std.fmt.allocPrintZ(allocator, "{d}", .{after_sequence});
+        const after_z = try allocPrintZCompat(allocator, "{d}", .{after_sequence});
         defer allocator.free(after_z);
-        const limit_z = try std.fmt.allocPrintZ(allocator, "{d}", .{limit});
+        const limit_z = try allocPrintZCompat(allocator, "{d}", .{limit});
         defer allocator.free(limit_z);
 
         const params = [_]?[*:0]const u8{ iid_z, after_z, limit_z };
@@ -1598,7 +1602,7 @@ const PostgresMemoryImpl = struct {
         defer self_.allocator.free(sql);
         const iid_z = try self_.allocator.dupeZ(u8, self_.localInstanceId());
         defer self_.allocator.free(iid_z);
-        const seq_z = try std.fmt.allocPrintZ(self_.allocator, "{d}", .{compacted_through});
+        const seq_z = try allocPrintZCompat(self_.allocator, "{d}", .{compacted_through});
         defer self_.allocator.free(seq_z);
         const params = [_]?[*:0]const u8{ iid_z, seq_z };
         const lengths = [_]c_int{ @intCast(self_.localInstanceId().len), @intCast(seq_z.len - 1) };
@@ -1981,19 +1985,19 @@ const PostgresMemoryImpl = struct {
         defer self.allocator.free(content_z);
         const category_z = try self.allocator.dupeZ(u8, category);
         defer self.allocator.free(category_z);
-        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        const sid_z: ?[:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |sid| self.allocator.free(sid);
         const iid_z = try self.allocator.dupeZ(u8, self.localInstanceId());
         defer self.allocator.free(iid_z);
-        const kind_z: ?[*:0]u8 = if (value_kind) |kind| try self.allocator.dupeZ(u8, kind) else null;
+        const kind_z: ?[:0]u8 = if (value_kind) |kind| try self.allocator.dupeZ(u8, kind) else null;
         defer if (kind_z) |kind| self.allocator.free(kind);
-        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{timestamp_ms});
+        const timestamp_z = try allocPrintZCompat(self.allocator, "{d}", .{timestamp_ms});
         defer self.allocator.free(timestamp_z);
         const origin_z = try self.allocator.dupeZ(u8, origin_instance_id);
         defer self.allocator.free(origin_z);
-        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{origin_sequence});
+        const origin_seq_z = try allocPrintZCompat(self.allocator, "{d}", .{origin_sequence});
         defer self.allocator.free(origin_seq_z);
-        const now = try std.fmt.allocPrintZ(self.allocator, "{d}", .{@divTrunc(timestamp_ms, 1000)});
+        const now = try allocPrintZCompat(self.allocator, "{d}", .{@divTrunc(timestamp_ms, 1000)});
         defer self.allocator.free(now);
 
         const params = [_]?[*:0]const u8{
@@ -2001,9 +2005,9 @@ const PostgresMemoryImpl = struct {
             key_z,
             content_z,
             category_z,
-            sid_z,
+            if (sid_z) |sid| sid.ptr else null,
             iid_z,
-            kind_z,
+            if (kind_z) |kind| kind.ptr else null,
             timestamp_z,
             origin_z,
             origin_seq_z,
@@ -2058,13 +2062,13 @@ const PostgresMemoryImpl = struct {
         defer self.allocator.free(scope_z);
         const session_key_z = try self.allocator.dupeZ(u8, session_key);
         defer self.allocator.free(session_key_z);
-        const sid_z: ?[*:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
+        const sid_z: ?[:0]u8 = if (session_id) |sid| try self.allocator.dupeZ(u8, sid) else null;
         defer if (sid_z) |sid| self.allocator.free(sid);
-        const timestamp_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{timestamp_ms});
+        const timestamp_z = try allocPrintZCompat(self.allocator, "{d}", .{timestamp_ms});
         defer self.allocator.free(timestamp_z);
         const origin_z = try self.allocator.dupeZ(u8, origin_instance_id);
         defer self.allocator.free(origin_z);
-        const origin_seq_z = try std.fmt.allocPrintZ(self.allocator, "{d}", .{origin_sequence});
+        const origin_seq_z = try allocPrintZCompat(self.allocator, "{d}", .{origin_sequence});
         defer self.allocator.free(origin_seq_z);
 
         const params = [_]?[*:0]const u8{
@@ -2072,7 +2076,7 @@ const PostgresMemoryImpl = struct {
             key_z,
             scope_z,
             session_key_z,
-            sid_z,
+            if (sid_z) |sid| sid.ptr else null,
             timestamp_z,
             origin_z,
             origin_seq_z,
@@ -2300,7 +2304,7 @@ const PostgresMemoryImpl = struct {
         const iid_z = try self_.allocator.dupeZ(u8, local_instance_id);
         defer self_.allocator.free(iid_z);
 
-        const total_z = try std.fmt.allocPrintZ(self_.allocator, "{d}", .{total_tokens});
+        const total_z = try allocPrintZCompat(self_.allocator, "{d}", .{total_tokens});
         defer self_.allocator.free(total_z);
         const params = [_]?[*:0]const u8{ sid_z, iid_z, total_z };
         const lengths = [_]c_int{ @intCast(session_id.len), @intCast(local_instance_id.len), @intCast(total_z.len) };
@@ -2360,7 +2364,7 @@ const PostgresMemoryImpl = struct {
         const offset_str = try std.fmt.bufPrintZ(&offset_buf, "{d}", .{offset});
 
         const params = [_]?[*:0]const u8{ iid_z, limit_str.ptr, offset_str.ptr };
-        const lengths = [_]c_int{ @intCast(local_instance_id.len), @intCast(std.mem.len(limit_str)), @intCast(std.mem.len(offset_str)) };
+        const lengths = [_]c_int{ @intCast(local_instance_id.len), @intCast(limit_str.len), @intCast(offset_str.len) };
 
         const result = try self_.execParams(self_.q_list_sessions, &params, &lengths);
         defer c.PQclear(result);
@@ -2433,8 +2437,8 @@ const PostgresMemoryImpl = struct {
         const lengths = [_]c_int{
             @intCast(session_id.len),
             @intCast(local_instance_id.len),
-            @intCast(std.mem.len(limit_str)),
-            @intCast(std.mem.len(offset_str)),
+            @intCast(limit_str.len),
+            @intCast(offset_str.len),
         };
 
         const result = try self_.execParams(self_.q_load_msgs_detailed, &params, &lengths);
@@ -2548,8 +2552,9 @@ const PostgresIntegrationTest = if (build_options.enable_postgres) struct {
     fn makeSchemaName(allocator: std.mem.Allocator) ![]u8 {
         var rand: [4]u8 = undefined;
         std.crypto.random.bytes(&rand);
-        const suffix = std.fmt.fmtSliceHexLower(&rand);
-        return std.fmt.allocPrint(allocator, "nullclaw_feed_{d}_{any}", .{ std.time.nanoTimestamp(), suffix });
+        var suffix_buf: [8]u8 = undefined;
+        const suffix = bytesToHexLower(&rand, &suffix_buf);
+        return std.fmt.allocPrint(allocator, "nullclaw_feed_{d}_{s}", .{ std.time.nanoTimestamp(), suffix });
     }
 } else struct {};
 
